@@ -1,0 +1,28 @@
+# Every item kind once — try it: `cargo run -p terminal_choice -- --file terminal_choice/examples/demo.toml`
+title = "Pizza order"
+
+[[item]]
+kind = "comment"
+text = """Comments are display-only: the cursor skips them.
+They can run several lines."""
+
+[[item]]
+kind = "checkboxes"
+label = "Toppings"
+options = ["olives", "onion", "feta", "mushrooms"]
+checked = ["onion"]
+
+[[item]]
+kind = "radio"
+label = "Size"
+options = ["S", "M", "L"]
+chosen = "M"
+
+[[item]]
+kind = "text"
+label = "Name"
+
+[[item]]
+kind = "text"
+label = "Delivery notes"
+value = "ring twice"

@@ -1,0 +1,18 @@
+# A library first (bashrs will import it once extracted to its own repo), with a small binary
+# so the same forms run standalone: `terminal_choice --file form.toml` or field flags.
+[package]
+name = "terminal_choice"
+version = "0.1.0"
+edition = "2021"
+description = "Interactive terminal forms — checkboxes, radios, text fields, fixed comments — defined in code, args, or TOML"
+license = "GPL-3.0-only"
+
+[dependencies]
+# The whole TUI: raw key reads, styling, line clearing. Small, and the same crate the parent
+# project already trusts (versions kept in step with it).
+console = "0.16"
+# The form-definition and answers format.
+toml = "1.1"
+# One blocking `poll` while waiting for a key — the guarantee that an idle form costs 0% CPU
+# lives here rather than in a dependency's internals. Already in the tree via `console`.
+libc = "0.2"
