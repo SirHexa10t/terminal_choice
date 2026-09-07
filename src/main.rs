@@ -8,8 +8,11 @@ use terminal_choice::{run, Form, Outcome};
 const USAGE: &str = "\
 terminal_choice — fill a form in the terminal, get the answers as TOML on stdout
 
-  terminal_choice --file FORM.toml
+  terminal_choice --file FORM.toml [--run-checks]
   terminal_choice [--title T] [--comment TEXT] [--checkbox SPEC] [--radio SPEC] [--text SPEC] …
+
+--run-checks answers a file's check_if / enabled_if predicates by running each as a shell
+command: exit 0 means yes. Off by default — a definition file is someone's shell to run.
 
 Field flags build the form in the order given. SPEC grammars:
   --checkbox \"Label: opt, opt, …\"     pre-check with a trailing   = opt, opt
@@ -17,6 +20,18 @@ Field flags build the form in the order given. SPEC grammars:
   --text     \"Label\"                  pre-fill with               = value
 
 Keys: ↑/↓ move · space picks · enter next/submit · esc cancels (exit 1, no output)";
+
+/// Whether `check` succeeds as a shell command. Output is discarded — a predicate answers with
+/// its status, and an installer-detection one-liner's chatter is not this form's business.
+fn shell_says_yes(check: &str) -> bool {
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(check)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -30,7 +45,17 @@ fn main() {
         [flag, path] if flag == "--file" => std::fs::read_to_string(path)
             .map_err(|err| format!("{path}: {err}"))
             .and_then(|text| Form::from_toml(&text)),
-        [flag, ..] if flag == "--file" => Err("--file takes exactly one path, and no other flags".into()),
+        // The file's `check_if` / `enabled_if` predicates, answered THIS binary's way: run each
+        // as a shell command and read its exit status. That is one program's choice of what a
+        // predicate means, not the library's — which knows nothing about shells.
+        [flag, path, run] | [flag, run, path] if flag == "--file" && run == "--run-checks" => {
+            std::fs::read_to_string(path)
+                .map_err(|err| format!("{path}: {err}"))
+                .and_then(|text| Form::from_toml_with(&text, shell_says_yes))
+        }
+        [flag, ..] if flag == "--file" => {
+            Err("--file takes one path, optionally with --run-checks, and no other flags".into())
+        }
         _ => Form::from_args(args),
     };
     let mut form = match built {

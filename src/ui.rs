@@ -32,8 +32,17 @@ pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
     for (index, item) in form.items.iter().enumerate() {
         match item {
             Item::Comment(_) => {}
-            Item::Checkboxes { options, .. } | Item::Radio { options, .. } => {
-                rows.extend((0..options.len()).map(|option| Focus::Option { item: index, option }));
+            // A disabled option gets no row, which IS the "not selectable" guarantee — the same
+            // way a comment's absence here is what makes comments unreachable. Nothing downstream
+            // needs to check: no key can name a row that does not exist.
+            Item::Checkboxes { enabled, .. } | Item::Radio { enabled, .. } => {
+                rows.extend(
+                    enabled
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, on)| **on)
+                        .map(|(option, _)| Focus::Option { item: index, option }),
+                );
             }
             Item::Text { .. } => rows.push(Focus::Text { item: index }),
         }
@@ -76,12 +85,14 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
         // Ctrl+A on a classic terminal (and the Home key). Toggle: all on, unless already all
         // on — then all off. Only checkbox groups; there is no "all" for radios or text.
         Key::Home => {
+            // Only the boxes that are the user's to change: "all" cannot mean reaching past a
+            // disabled one, and a disabled box must not decide whether "all" is already true.
             let mut boxes = 0;
             let mut ticked = 0;
             for item in &form.items {
-                if let Item::Checkboxes { checked, .. } = item {
-                    boxes += checked.len();
-                    ticked += checked.iter().filter(|on| **on).count();
+                if let Item::Checkboxes { checked, enabled, .. } = item {
+                    boxes += enabled.iter().filter(|on| **on).count();
+                    ticked += checked.iter().zip(enabled).filter(|(on, live)| **on && **live).count();
                 }
             }
             if boxes == 0 {
@@ -89,8 +100,12 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
             }
             let everything_on = ticked == boxes;
             for item in &mut form.items {
-                if let Item::Checkboxes { checked, .. } = item {
-                    checked.iter_mut().for_each(|on| *on = !everything_on);
+                if let Item::Checkboxes { checked, enabled, .. } = item {
+                    for (on, live) in checked.iter_mut().zip(enabled) {
+                        if *live {
+                            *on = !everything_on;
+                        }
+                    }
                 }
             }
         }
@@ -118,9 +133,11 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
                 // every group at once — a thing cannot be both doomed and spared.
                 if let Some((name, state)) = mirror {
                     for item in &mut form.items {
-                        if let Item::Checkboxes { options, checked, .. } = item {
+                        if let Item::Checkboxes { options, checked, enabled, .. } = item {
                             for (slot, text) in options.iter().enumerate() {
-                                if *text == name {
+                                // A twin the user cannot touch is not moved by touching its
+                                // sibling either — "not yours to change" holds from every angle.
+                                if *text == name && enabled[slot] {
                                     checked[slot] = state;
                                 }
                             }
@@ -244,7 +261,13 @@ fn _await_input(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
 /// The full form as displayable lines, the focused row inverted, everything clipped to `width`
 /// so no line can wrap (a wrapped line would break the redraw arithmetic — the loop clears
 /// exactly as many lines as it printed).
-pub(crate) fn render(form: &Form, rows: &[Focus], focus: usize, width: usize) -> Vec<String> {
+pub(crate) fn render(
+    form: &Form,
+    rows: &[Focus],
+    focus: usize,
+    width: usize,
+    warnings: &[String],
+) -> Vec<String> {
     let mut lines = Vec::new();
     if let Some(title) = &form.title {
         lines.push(console::style(title).bold().to_string());
@@ -275,30 +298,36 @@ pub(crate) fn render(form: &Form, rows: &[Focus], focus: usize, width: usize) ->
                     );
                 }
             }
-            Item::Checkboxes { label, options, checked } => {
+            Item::Checkboxes { label, options, checked, headings, enabled } => {
                 // An anonymous group draws no heading — it exists to sit flush inside
                 // surrounding comments (a tree of rows, some of them tickable).
                 if !label.is_empty() {
                     lines.push(format!("{label}:"));
                 }
                 for (option, name) in options.iter().enumerate() {
+                    lines.extend(subtitle(headings, option, comment_indent, &clean));
                     let box_mark = if checked[option] { "[x]" } else { "[ ]" };
-                    lines.push(mark(
-                        format!("{box_mark} {}", clean(name.clone())),
-                        Focus::Option { item: index, option },
-                    ));
+                    let row = format!("{box_mark} {}", clean(name.clone()));
+                    lines.push(match enabled[option] {
+                        // Dim, and never marked: the focus list has no row for it, so `mark`
+                        // could not report it focused anyway — this only says so visibly.
+                        false => console::style(format!("  {row}")).dim().to_string(),
+                        true => mark(row, Focus::Option { item: index, option }),
+                    });
                 }
             }
-            Item::Radio { label, options, chosen } => {
+            Item::Radio { label, options, chosen, headings, enabled } => {
                 if !label.is_empty() {
                     lines.push(format!("{label}:"));
                 }
                 for (option, name) in options.iter().enumerate() {
+                    lines.extend(subtitle(headings, option, comment_indent, &clean));
                     let dot = if *chosen == Some(option) { "(•)" } else { "( )" };
-                    lines.push(mark(
-                        format!("{dot} {}", clean(name.clone())),
-                        Focus::Option { item: index, option },
-                    ));
+                    let row = format!("{dot} {}", clean(name.clone()));
+                    lines.push(match enabled[option] {
+                        false => console::style(format!("  {row}")).dim().to_string(),
+                        true => mark(row, Focus::Option { item: index, option }),
+                    });
                 }
             }
             Item::Text { label, value } => {
@@ -308,6 +337,17 @@ pub(crate) fn render(form: &Form, rows: &[Focus], focus: usize, width: usize) ->
     }
     lines.push(String::new());
     lines.push(mark("[ Submit ]".to_string(), Focus::Submit));
+    // Cautions sit between Submit and the key hints: under the thing they are a caution ABOUT,
+    // where the eye already is before pressing it, and above the hints so that several of them
+    // push the hints down the screen rather than scrolling themselves off it.
+    for warning in warnings {
+        for (line, text) in _wrap(&clean(warning.clone()), width.saturating_sub(4)).iter().enumerate()
+        {
+            // Continuations hang under the first line's text, not under its marker.
+            let lead = if line == 0 { "  ⚠ " } else { "    " };
+            lines.push(console::style(format!("{lead}{text}")).red().to_string());
+        }
+    }
     lines.push(
         console::style("↑/↓ move · space picks · ctrl+a all/none · enter next/submit · esc cancels")
             .dim()
@@ -316,11 +356,105 @@ pub(crate) fn render(form: &Form, rows: &[Focus], focus: usize, width: usize) ->
     lines.into_iter().map(|line| console::truncate_str(&line, width, "…").into_owned()).collect()
 }
 
+/// A sub-title standing above option `slot`, as rendered lines — dim, like a comment, because
+/// that is what it is: the file's own words about the options beneath it. Empty when the option
+/// carries none, which is most of them.
+fn subtitle(
+    headings: &[Option<String>],
+    slot: usize,
+    indent: &str,
+    clean: &impl Fn(String) -> String,
+) -> Vec<String> {
+    let Some(Some(said)) = headings.get(slot) else {
+        return Vec::new();
+    };
+    said.lines()
+        .map(|line| console::style(format!("{indent}{}", clean(line.to_string()))).dim().to_string())
+        .collect()
+}
+
+/// The cautions one repaint shows, from both doors: what the definition declared, in its own
+/// order, then whatever this run's caller adds on top. Split out from the loop so the composition
+/// is testable without a terminal, like everything else that decides what appears.
+fn _notes(form: &mut Form, warn: &mut impl FnMut(&mut Form) -> Vec<String>) -> Vec<String> {
+    // The hook runs FIRST: it may restyle rows, and a declared warning read before that would
+    // describe a form that is about to change on screen.
+    let supplied = warn(form);
+    let mut notes: Vec<String> = form.active_warnings().into_iter().map(String::from).collect();
+    notes.extend(supplied);
+    notes
+}
+
+/// `text` broken at spaces into lines of at most `width` display cells. Warnings are prose, and
+/// prose that runs off the edge is a warning nobody reads — every other row here is a label or an
+/// option, short by nature, and truncation serves those fine.
+///
+/// A word wider than the budget still gets its own line rather than being split mid-glyph; the
+/// caller's final truncation pass trims it. Empty lines never survive, so a blank warning renders
+/// as nothing at all instead of a red gap.
+fn _wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = vec![String::new()];
+    for word in text.split_whitespace() {
+        let line = lines.last_mut().expect("seeded with one line");
+        let grown = console::measure_text_width(line) + 1 + console::measure_text_width(word);
+        if !line.is_empty() && grown > width {
+            lines.push(word.to_string());
+        } else {
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+    }
+    lines.retain(|line| !line.is_empty());
+    lines
+}
+
 /// Run `form` interactively on the terminal; the form's own state carries the answers.
 ///
 /// Drawn on stderr, so a scripted caller can pipe stdout (where a binary prints the answers)
 /// while the form still appears. Not a terminal → an error naming the problem, not a hang.
 pub fn run(form: &mut Form) -> std::io::Result<Outcome> {
+    run_with_warnings(form, |_| Vec::new())
+}
+
+/// [`run`], plus a line of red under the form for each string `warn` returns — on top of the
+/// form's own declared warnings, which [`run`] shows too.
+///
+/// `warn` is the per-repaint hook: called fresh every time the form is drawn, with the form as it
+/// stands. What it says is entirely the caller's business, and nothing here constrains it — it
+/// may consult the machine, the filesystem, its own tables. That is the point of a closure over
+/// the file vocabulary in [`crate::Condition`]: "this path already exists", "that needs a reboot"
+/// are not things a form library can be taught, and any program should warn for its own reasons.
+///
+/// It takes the form by `&mut` so it can also change how the form LOOKS before that repaint —
+/// option text carries ANSI, so a caller marks the rows it wants noticed by rewriting them. Do
+/// not change ANSWERS from here: ticking a box the user did not tick moves the form under their
+/// hands, and they have no way to know it happened.
+///
+/// Warnings never gate anything. Submitting is still allowed while every one of them shows —
+/// they exist to say "this is unusual" before the user commits to it, not to refuse.
+///
+/// The closure is passed to the RUN rather than stored on the [`Form`], which is what lets a
+/// form stay `Clone`, `PartialEq` and loadable from TOML: a boxed function is none of those.
+///
+/// ```no_run
+/// # use terminal_choice::{Form, run_with_warnings};
+/// let mut form = Form::new().checkboxes("packages", &["mullvad", "wireguard", "zed"]);
+/// let vpns = ["mullvad", "wireguard"];
+/// run_with_warnings(&mut form, |form| {
+///     let picked = form.checked("packages");
+///     match picked.iter().filter(|name| vpns.contains(name)).count() >= 2 {
+///         true => vec!["More than one VPN client — unusual, but allowed.".to_string()],
+///         false => Vec::new(),
+///     }
+/// })?;
+/// # Ok::<(), std::io::Error>(())
+/// ```
+pub fn run_with_warnings(
+    form: &mut Form,
+    mut warn: impl FnMut(&mut Form) -> Vec<String>,
+) -> std::io::Result<Outcome> {
     let term = Term::stderr();
     if !term.is_term() {
         return Err(std::io::Error::other(
@@ -339,7 +473,10 @@ pub fn run(form: &mut Form) -> std::io::Result<Outcome> {
         // terminal produces (focus reports, stray escapes) without a single write.
         term.clear_last_lines(on_screen)?;
         let width = term.size().1 as usize;
-        let lines = render(form, &rows, focus, width.max(20));
+        // Asked again every repaint, so the cautions — and any emphasis the caller paints on
+        // the rows — track the answers as they change.
+        let notes = _notes(form, &mut warn);
+        let lines = render(form, &rows, focus, width.max(20), &notes);
         for line in &lines {
             term.write_line(line)?;
         }
@@ -373,6 +510,7 @@ pub fn run(form: &mut Form) -> std::io::Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Condition; // the tests declare warnings; the renderer only draws them
 
     fn form() -> Form {
         Form::new()
@@ -380,6 +518,217 @@ mod tests {
             .checkboxes("Tops", &["a", "b"])
             .radio("Size", &["S", "M"])
             .text("Name", "")
+    }
+
+    /// The two doors compose: what a definition declared, then what this run's caller adds. A
+    /// program is never made to choose between them, and neither can silence the other.
+    #[test]
+    fn declared_and_supplied_warnings_both_show() {
+        let mut form = Form::new().checkboxes("Tops", &["a", "b"]).warning(
+            "declared: both ticked",
+            Condition::Checked { label: "Tops".into(), options: vec!["a".into(), "b".into()] },
+        );
+        let supplied = |form: &mut Form| match form.checked("Tops").is_empty() {
+            true => vec!["supplied: nothing chosen".to_string()],
+            false => Vec::new(),
+        };
+        let none = |_: &mut Form| Vec::new();
+
+        // Only the closure's, at first — the declared rule needs both boxes.
+        assert_eq!(_notes(&mut form, &mut supplied.clone()), ["supplied: nothing chosen"]);
+        assert!(
+            _notes(&mut form, &mut none.clone()).is_empty(),
+            "a plain run shows only what was declared"
+        );
+
+        let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
+        checked[0] = true;
+        checked[1] = true;
+        // Now only the declared one — and it shows even with an empty closure, which is what
+        // `run` passes, so a TOML-defined form warns without any code at all.
+        assert_eq!(_notes(&mut form, &mut supplied.clone()), ["declared: both ticked"]);
+        assert_eq!(_notes(&mut form, &mut none.clone()), ["declared: both ticked"]);
+
+        // Both at once, declared first.
+        let mut always = |_: &mut Form| vec!["supplied: always".to_string()];
+        assert_eq!(_notes(&mut form, &mut always), ["declared: both ticked", "supplied: always"]);
+    }
+
+    /// Warnings are the CALLER's judgement, drawn here and nowhere decided here: `render` takes
+    /// finished text. They land between Submit and the key hints, in red, and prose too wide for
+    /// the terminal wraps rather than being cut — a warning nobody can read is not one.
+    #[test]
+    fn warnings_draw_in_red_between_submit_and_the_hints() {
+        let form = form();
+        let rows = focusables(&form);
+        let plain = |lines: &[String]| -> Vec<String> {
+            lines.iter().map(|l| console::strip_ansi_codes(l).into_owned()).collect()
+        };
+
+        // Nothing supplied, nothing drawn: the block costs a form that wants none of it nothing.
+        let quiet = plain(&render(&form, &rows, 0, 40, &[]));
+        assert!(!quiet.iter().any(|line| line.contains('\u{26a0}')), "{quiet:?}");
+
+        let said = "Two VPN clients at once is unusual, but you are allowed to do it anyway.";
+        let loud = render(&form, &rows, 0, 40, &[said.to_string()]);
+        let flat = plain(&loud);
+
+        let first = flat.iter().position(|line| line.contains('\u{26a0}')).expect("a warning shows");
+        let submit = flat.iter().position(|line| line.contains("[ Submit ]")).expect("submit");
+        let hints = flat.iter().position(|line| line.contains("\u{2191}/\u{2193}")).expect("hints");
+        assert!(submit < first && first < hints, "warning sits between them: {flat:?}");
+        // Red — asserted against the same styling call, so this holds whether or not colours are
+        // enabled here. Under NO_COLOR (or a pipe) the marker still carries the meaning alone.
+        assert_eq!(
+            loud[first],
+            console::style("  \u{26a0} Two VPN clients at once is unusual,").red().to_string(),
+            "the warning line is the red-styled first wrap"
+        );
+
+        // Wrapped, not truncated, and the sentence survives whole across the lines.
+        let block: Vec<&String> = flat[first..hints].iter().collect();
+        assert!(block.len() > 1, "40 columns cannot hold that sentence: {block:?}");
+        assert!(block.iter().all(|line| !line.contains('\u{2026}')), "wrapped: {block:?}");
+        assert!(block[1].starts_with("    ") && !block[1].contains('\u{26a0}'), "hangs: {:?}", block[1]);
+        let rejoined: String = block.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" ");
+        assert_eq!(rejoined, format!("\u{26a0} {said}"));
+    }
+
+    /// What `run` does every repaint, without a terminal: ask the caller again. The point of a
+    /// closure over a stored rule is that the answer may depend on anything at all — here, on
+    /// the form's own state, which is the case a fixed condition vocabulary would have covered
+    /// and the many that it would not.
+    #[test]
+    fn the_caller_is_asked_again_on_every_repaint() {
+        let mut form = form();
+        let rows = focusables(&form);
+        let vpns = ["a", "b"];
+        let warn = |form: &Form| -> Vec<String> {
+            let picked = form.checked("Tops");
+            match picked.iter().filter(|name| vpns.contains(name)).count() >= 2 {
+                true => vec!["Two at once.".to_string()],
+                false => Vec::new(),
+            }
+        };
+        let showing = |form: &Form| {
+            render(form, &rows, 0, 60, &warn(form))
+                .iter()
+                .any(|line| console::strip_ansi_codes(line).contains("Two at once."))
+        };
+
+        assert!(!showing(&form), "nothing ticked yet");
+        let mut focus = 0;
+        apply(&mut form, &rows, &mut focus, Key::Char(' ')); // tick "a"
+        assert!(!showing(&form), "one is a normal answer");
+        focus = 1;
+        apply(&mut form, &rows, &mut focus, Key::Char(' ')); // tick "b"
+        assert!(showing(&form), "the second tick brings it out");
+        apply(&mut form, &rows, &mut focus, Key::Char(' ')); // untick "b"
+        assert!(!showing(&form), "and unticking takes it away again");
+    }
+
+    /// "Not selectable" is enforced by absence, not by a check: a disabled option has no focus
+    /// row, so no key can name it. Ctrl+A and duplicate-mirroring reach boxes WITHOUT the focus
+    /// list, though, so each is verified separately — those are the two ways past the guarantee.
+    #[test]
+    fn a_disabled_option_cannot_be_reached_by_any_key() {
+        let mut form = Form::new().checkboxes("Tops", &["a", "b", "c"]);
+        let Item::Checkboxes { enabled, checked, .. } = &mut form.items[0] else { panic!() };
+        enabled[1] = false;
+        checked[1] = true; // it arrives ticked, and must stay ticked
+
+        let rows = focusables(&form);
+        assert_eq!(
+            rows,
+            [
+                Focus::Option { item: 0, option: 0 },
+                Focus::Option { item: 0, option: 2 },
+                Focus::Submit
+            ],
+            "the disabled option has no row at all"
+        );
+
+        // Space, everywhere it can land: never reaches option 1.
+        let mut focus = 0;
+        for _ in 0..rows.len() * 2 {
+            apply(&mut form, &rows, &mut focus, Key::Char(' '));
+            apply(&mut form, &rows, &mut focus, Key::ArrowDown);
+        }
+        let Item::Checkboxes { checked, .. } = &form.items[0] else { panic!() };
+        assert!(checked[1], "a fixed box keeps its state through every keystroke");
+
+        // Ctrl+A: flips what is the user's, leaves what is not.
+        let mut form = Form::new().checkboxes("Tops", &["a", "b", "c"]);
+        let Item::Checkboxes { enabled, .. } = &mut form.items[0] else { panic!() };
+        enabled[1] = false;
+        let rows = focusables(&form);
+        let mut focus = 0;
+        apply(&mut form, &rows, &mut focus, Key::Home);
+        let Item::Checkboxes { checked, .. } = &form.items[0] else { panic!() };
+        assert_eq!(checked, &[true, false, true], "all-on skips the fixed box");
+        apply(&mut form, &rows, &mut focus, Key::Home);
+        let Item::Checkboxes { checked, .. } = &form.items[0] else { panic!() };
+        assert_eq!(
+            checked,
+            &[false, false, false],
+            "every box it may touch was on, so the second press clears those and only those"
+        );
+    }
+
+    /// Mirroring reaches boxes by NAME, in every group at once — so a disabled twin is the one
+    /// place a locked box could be moved by touching something else. It is not.
+    #[test]
+    fn mirroring_does_not_move_a_locked_twin() {
+        let mut form =
+            Form::new().checkboxes("Left", &["shared"]).checkboxes("Right", &["shared"]);
+        form.mirror_duplicates = true;
+        let Item::Checkboxes { enabled, .. } = &mut form.items[1] else { panic!() };
+        enabled[0] = false;
+
+        let rows = focusables(&form);
+        let mut focus = 0;
+        apply(&mut form, &rows, &mut focus, Key::Char(' '));
+
+        let Item::Checkboxes { checked, .. } = &form.items[0] else { panic!() };
+        assert!(checked[0], "the one that was ticked");
+        let Item::Checkboxes { checked, .. } = &form.items[1] else { panic!() };
+        assert!(!checked[0], "its locked twin stayed put");
+    }
+
+    /// Sub-titles draw dim above the option they belong to, and a disabled option draws dim
+    /// itself — the two ways this form says "read, do not touch".
+    #[test]
+    fn sub_titles_and_locked_options_are_drawn_dim() {
+        let mut form = Form::new().checkboxes("Packages", &["zed", "helix", "apt"]);
+        let Item::Checkboxes { headings, enabled, .. } = &mut form.items[0] else { panic!() };
+        headings[0] = Some("dev-tools".into());
+        headings[2] = Some("system\n(not yours)".into());
+        enabled[2] = false;
+
+        let rows = focusables(&form);
+        let drawn = render(&form, &rows, 0, 100, &[]);
+        let flat: Vec<String> =
+            drawn.iter().map(|l| console::strip_ansi_codes(l).trim_end().to_string()).collect();
+
+        assert_eq!(
+            flat,
+            [
+                "Packages:",
+                "  dev-tools",
+                "▸ [ ] zed",
+                "  [ ] helix",
+                "  system",
+                "  (not yours)",
+                "  [ ] apt",
+                "",
+                "  [ Submit ]",
+                "↑/↓ move · space picks · ctrl+a all/none · enter next/submit · esc cancels",
+            ],
+            "{flat:#?}"
+        );
+        // The locked row is styled like a comment, not like a focusable one.
+        let locked = drawn.iter().find(|l| l.contains("apt")).expect("drawn");
+        assert_eq!(locked, &console::style("  [ ] apt").dim().to_string());
     }
 
     #[test]
@@ -549,7 +898,7 @@ mod tests {
         let glow = "kill \x1b[30;41mfirefox\x1b[0m now";
         let coloured = Form::new().checkboxes("Pick", &[glow]);
         let rows = focusables(&coloured);
-        let lines = render(&coloured, &rows, 0, 200);
+        let lines = render(&coloured, &rows, 0, 200, &[]);
         let focused = lines.iter().find(|l| l.contains("firefox")).unwrap();
         assert!(focused.contains("\x1b[30;41m"), "the caller's colours are kept: {focused:?}");
         assert!(
@@ -558,7 +907,7 @@ mod tests {
         );
         let scrubbed = Form::new().checkboxes("Pick", &[glow]).scrub_colors();
         let rows = focusables(&scrubbed);
-        let lines = render(&scrubbed, &rows, 0, 200);
+        let lines = render(&scrubbed, &rows, 0, 200, &[]);
         let row = lines.iter().find(|l| l.contains("firefox")).unwrap();
         assert!(!row.contains("30;41"), "scrubbed means gone: {row:?}");
     }
@@ -628,7 +977,7 @@ mod tests {
                 form = form.aligned();
             }
             let rows = focusables(&form);
-            render(&form, &rows, rows.len() - 1, 120)
+            render(&form, &rows, rows.len() - 1, 120, &[])
                 .iter()
                 .map(|l| console::strip_ansi_codes(l).into_owned())
                 .collect::<Vec<_>>()
@@ -666,7 +1015,7 @@ mod tests {
         let Item::Radio { chosen, .. } = &mut form.items[2] else { panic!() };
         *chosen = Some(0);
         let rows = focusables(&form);
-        let lines = render(&form, &rows, 0, 120);
+        let lines = render(&form, &rows, 0, 120, &[]);
         let plain: Vec<String> =
             lines.iter().map(|l| console::strip_ansi_codes(l).into_owned()).collect();
         let all = plain.join("\n");
@@ -680,7 +1029,7 @@ mod tests {
             "one focus marker: {all}"
         );
         // No line may exceed the width it was clipped for — wrapping breaks the redraw.
-        let narrow = render(&form, &rows, 0, 24);
+        let narrow = render(&form, &rows, 0, 24, &[]);
         for line in &narrow {
             let visible = console::measure_text_width(line);
             assert!(visible <= 24, "line of visible width {visible} would wrap: {line:?}");

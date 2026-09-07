@@ -16,3 +16,4 @@ toml = "1.1"
 # One blocking `poll` while waiting for a key — the guarantee that an idle form costs 0% CPU
 # lives here rather than in a dependency's internals. Already in the tree via `console`.
 libc = "0.2"
+toml_edit = "0.25.13"
