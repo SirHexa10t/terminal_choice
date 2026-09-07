@@ -24,6 +24,11 @@
 //!
 //! Warnings never gate anything: an odd set of answers is still an answer, and every one of them
 //! can be submitted while every warning shows.
+//!
+//! One thing a run marks on its own, needing nothing from the caller: a checkbox that the form
+//! ARRIVED with ticked and the user has since cleared is drawn red. Only that direction — a form
+//! that opens empty and gets filled in would otherwise mark every answer it was given — because
+//! clearing a tick the form asserted reads as undoing a fact, and is worth seeing before submit.
 
 mod comments;
 mod definition;
@@ -65,6 +70,95 @@ pub enum Item {
     },
     /// Free text, editable in place.
     Text { label: String, value: String },
+    /// A table of checkboxes: one row per thing, one column per way of having it.
+    ///
+    /// For the choice that is not "which of these" but "which of these, HOW" — a package and the
+    /// managers that carry it, a file and the machines to write it to. A row of independent
+    /// checkbox groups could hold the same answers, but not the same question: the point is that
+    /// the columns line up down the page, so a column can be read as a column.
+    Grid {
+        label: String,
+        /// Column headings, left to right. Drawn truncated to the width of a box, since the
+        /// focused cell's own line says which column it is in full.
+        columns: Vec<String>,
+        rows: Vec<GridRow>,
+    },
+}
+
+/// One row of an [`Item::Grid`]: a thing, and one cell per column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GridRow {
+    /// Named after the boxes rather than before them, so the boxes of every row start in the
+    /// same place and the columns read straight down.
+    pub label: String,
+    /// A sub-title drawn above this row — the "# category" line that breaks a long table into
+    /// sections. Multi-line headings draw on several lines.
+    pub heading: Option<String>,
+    /// A remark drawn after the label, dim, aligned into a column of its own — what the thing IS,
+    /// where the name alone does not say. Display only: [`GridRow::label`] stays the answer.
+    pub note: Option<String>,
+    /// Parallel to the grid's `columns`. A row with fewer cells than there are columns simply
+    /// has nothing to say about the rest, which draws as blank.
+    pub cells: Vec<GridCell>,
+}
+
+/// One box of an [`Item::Grid`], and what it would do.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GridCell {
+    pub checked: bool,
+    /// Whether this cell is the user's to change. A disabled cell is drawn dim and the cursor
+    /// never lands on it.
+    pub enabled: bool,
+    /// Whether there is a box here at all.
+    ///
+    /// The distinction a disabled box cannot make on its own, and the one that decides whether a
+    /// reader has anything to think about. A dim `[ ]` says "this column COULD serve this row,
+    /// but not as things stand" — which is a prompt: make it so, and this becomes available. A
+    /// gap says "this column can never serve this row", and asks nothing of anybody.
+    ///
+    /// Draw a gap only for the second. Drawing one for the first hides an option behind a
+    /// character that means "nothing here".
+    pub boxed: bool,
+    /// What ticking this would do, shown under the form while the cursor is on it and it is
+    /// CLEAR. The two are separate because a box's meaning depends on which way it is about to
+    /// move: over an empty box the interesting line is the one that fills it.
+    pub on_set: Option<String>,
+    /// What clearing this would do, shown while the cursor is on it and it is TICKED.
+    pub on_clear: Option<String>,
+}
+
+impl GridCell {
+    /// A cell the user may tick, doing `on_set`.
+    #[must_use]
+    pub fn open(on_set: Option<String>) -> Self {
+        Self { checked: false, enabled: true, boxed: true, on_set, on_clear: None }
+    }
+
+    /// A cell that arrives ticked, and would do `on_clear` if emptied.
+    #[must_use]
+    pub fn set(on_clear: Option<String>) -> Self {
+        Self { checked: true, enabled: true, boxed: true, on_set: None, on_clear }
+    }
+
+    /// A box that is shown but not the user's to change — dim, and space does nothing on it.
+    ///
+    /// Still a BOX, and still somewhere the cursor can rest: a reader deciding what to go and
+    /// set up needs to see the choice that is out of reach, and `would` is what it would run
+    /// once it were not. That line under the cursor is the whole argument for installing
+    /// whatever this column needs.
+    #[must_use]
+    pub fn locked(checked: bool, would: Option<String>) -> Self {
+        match checked {
+            true => Self { checked, enabled: false, boxed: true, on_set: None, on_clear: would },
+            false => Self { checked, enabled: false, boxed: true, on_set: would, on_clear: None },
+        }
+    }
+
+    /// No box: this column can never serve this row. Draws as a gap.
+    #[must_use]
+    pub fn blank() -> Self {
+        Self::default()
+    }
 }
 
 /// One caution a form shows about the answers currently in it: what to say, and the
@@ -197,6 +291,17 @@ impl Form {
             headings: vec![None; options.len()],
             enabled: vec![true; options.len()],
             options: options.iter().map(|s| s.to_string()).collect(),
+        });
+        self
+    }
+
+    /// A table of checkboxes — see [`Item::Grid`]. Rows are built by the caller, since what a
+    /// cell offers is entirely the caller's business.
+    pub fn grid(mut self, label: impl Into<String>, columns: &[&str], rows: Vec<GridRow>) -> Self {
+        self.items.push(Item::Grid {
+            label: label.into(),
+            columns: columns.iter().map(|column| (*column).to_string()).collect(),
+            rows,
         });
         self
     }
@@ -458,6 +563,27 @@ impl Form {
                 }
                 Item::Text { label, value } => {
                     table.insert(label.clone(), toml::Value::String(value.clone()));
+                }
+                // A grid answers in two dimensions, so it answers as a table of them: each row
+                // that has anything ticked maps to the columns it ticked. A row with none is
+                // omitted rather than written empty — unlike a checkbox group, where "asked,
+                // none apply" is itself the answer, a blank grid row is simply not part of it.
+                Item::Grid { label, columns, rows } => {
+                    let mut picked = toml::value::Table::new();
+                    for row in rows {
+                        let ticked: Vec<toml::Value> = row
+                            .cells
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, cell)| cell.checked)
+                            .filter_map(|(at, _)| columns.get(at))
+                            .map(|column| toml::Value::String(column.clone()))
+                            .collect();
+                        if !ticked.is_empty() {
+                            picked.insert(row.label.clone(), toml::Value::Array(ticked));
+                        }
+                    }
+                    table.insert(label.clone(), toml::Value::Table(picked));
                 }
             }
         }

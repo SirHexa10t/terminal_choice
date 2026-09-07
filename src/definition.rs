@@ -394,7 +394,10 @@ fn _reject_duplicate_labels(form: &Form) -> Result<(), String> {
     for item in &form.items {
         let label = match item {
             Item::Comment(_) => continue,
-            Item::Checkboxes { label, .. } | Item::Radio { label, .. } | Item::Text { label, .. } => label,
+            Item::Checkboxes { label, .. }
+            | Item::Radio { label, .. }
+            | Item::Text { label, .. }
+            | Item::Grid { label, .. } => label,
         };
         // An empty label is deliberate anonymity (an embedded group whose owner reads `items`
         // directly), so several may coexist — they never become answer keys.
