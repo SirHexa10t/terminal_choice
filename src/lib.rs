@@ -68,6 +68,63 @@ pub enum Item {
     },
 }
 
+/// One box of the filter block: which entries it governs, and the words on it.
+///
+/// A rule rather than a tag, because the useful filters are not tags. "terminal-only" is not the
+/// `terminal` tag — plenty of things carry both `terminal` and `gui` — it is `terminal` AND NOT
+/// `gui`. A one-tag filter cannot say that, and a filter that cannot say it hides the wrong rows.
+///
+/// The shape is a conjunction: every tag in `all_of` must be present and every tag in `none_of`
+/// must be absent. That covers what a filter row is actually asked to express, and stops short of
+/// a general boolean language nobody would type into a `const`.
+///
+/// ```
+/// # use terminal_choice::Rule;
+/// let only = Rule::of("terminal-only", &["terminal", "!gui"]);
+/// assert!(only.matches(&["terminal".into()]));
+/// assert!(!only.matches(&["terminal".into(), "gui".into()]), "both means neither -only");
+/// assert!(!only.matches(&["gui".into()]));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rule {
+    /// The words on the box. Also its identity in [`Form::excluded`], so keep them distinct.
+    pub label: String,
+    /// Tags the entry must carry — all of them.
+    pub all_of: Vec<String>,
+    /// Tags the entry must not carry — any one of them disqualifies it.
+    pub none_of: Vec<String>,
+}
+
+impl Rule {
+    /// A rule from `label` and terms, where a leading `!` negates: `["terminal", "!gui"]`.
+    ///
+    /// The `!` is read HERE, once, rather than at every match — so the stored rule is already
+    /// split into what must hold and what must not, and nothing downstream parses anything.
+    #[must_use]
+    pub fn of(label: impl Into<String>, terms: &[&str]) -> Self {
+        let mut all_of = Vec::new();
+        let mut none_of = Vec::new();
+        for term in terms {
+            match term.strip_prefix('!') {
+                Some(tag) => none_of.push(tag.to_string()),
+                None => all_of.push((*term).to_string()),
+            }
+        }
+        Self { label: label.into(), all_of, none_of }
+    }
+
+    /// Whether an entry carrying `tags` is one this rule governs.
+    ///
+    /// A rule with no terms at all matches EVERYTHING, and clearing its box would empty the form.
+    /// Not guarded against: it is a caller writing a filter that says nothing, and inventing a
+    /// silent exception would hide the mistake rather than the rows.
+    #[must_use]
+    pub fn matches(&self, tags: &[String]) -> bool {
+        self.all_of.iter().all(|want| tags.iter().any(|tag| tag == want))
+            && !self.none_of.iter().any(|deny| tags.iter().any(|tag| tag == deny))
+    }
+}
+
 /// One option of a choice group — [`Item::Checkboxes`] or [`Item::Radio`].
 ///
 /// Replaces what were six arrays running alongside each other: `options`, `checked`, `headings`,
@@ -373,13 +430,13 @@ pub struct Form {
     /// Addressed by position rather than by heading text because two sections may legitimately be
     /// called the same thing. Meaningless while `collapsible` is false, and ignored then.
     pub collapsed: std::collections::BTreeSet<(usize, usize)>,
-    /// Tags the user may filter on, in display order, as `(tag, wording)` — see
-    /// [`Form::filters`]. Empty means no filter block, which is every form that never asks.
-    pub filters: Vec<(String, String)>,
+    /// The filter boxes, in display order — see [`Form::filters`]. Empty means no filter block,
+    /// which is every form that never asks.
+    pub filters: Vec<Rule>,
     /// The heading above that block.
     pub filter_label: String,
-    /// Which of those tags are currently CLEARED. Display state, like `collapsed`: an entry
-    /// filtered out of sight keeps every answer it had.
+    /// Which filter boxes are currently CLEARED, by [`Rule::label`]. Display state, like
+    /// `collapsed`: an entry filtered out of sight keeps every answer it had.
     pub excluded: std::collections::BTreeSet<String>,
 }
 
@@ -461,20 +518,25 @@ impl Form {
 
     /// Offer a block of tick-boxes, one per tag, that hides entries carrying the tags it clears.
     ///
-    /// `label` heads the block; each `(tag, wording)` pairs the tag as entries carry it with the
-    /// words to show. Every one starts ticked, so a form opens showing everything.
+    /// `label` heads the block; each box is `(terms, wording)`, where the terms are a [`Rule`] in
+    /// the `["terminal", "!gui"]` shorthand. Every box starts ticked, so a form opens showing
+    /// everything.
     ///
-    /// The list is the CALLER's: it decides which tags are worth filtering on. Entries carry
-    /// their own tags already ([`GridRow::tags`]), so nothing has to be registered here twice.
+    /// The list is the CALLER's: it decides what is worth filtering on. Entries carry their own
+    /// tags already ([`GridRow::tags`]), so nothing has to be registered here twice.
     ///
     /// ## What clearing one does
     ///
-    /// An entry is hidden when it carries ANY cleared tag — not shown when it matches any that
-    /// remain. The difference only shows on an entry with two tags, and it is the difference
-    /// between a filter that works and one that leaks: clearing `spyware` has to remove the
-    /// spyware, including whatever is also tagged `gui`.
+    /// An entry is hidden when ANY CLEARED box governs it — that is, when its tags satisfy that
+    /// box's rule. Not shown when some other box still does.
     ///
-    /// An entry with no tags is never hidden, having nothing to be excluded by.
+    /// Rules rather than plain tags because the interesting filters are negative. `terminal-only`
+    /// is not the `terminal` tag: a thing carrying both `terminal` and `gui` is neither
+    /// terminal-only nor GUI-only, and clearing either box must leave it alone. Written as tags
+    /// it would vanish from both, which is the wrong answer twice.
+    ///
+    /// An entry no cleared box governs is never hidden — including an entry with no tags, which
+    /// no rule with any positive term can match.
     ///
     /// ```
     /// # use terminal_choice::{Form, GridCell, GridRow};
@@ -490,17 +552,32 @@ impl Form {
     ///         row("ripgrep", &["terminal"]),
     ///         row("zoom", &["gui", "spyware"]),
     ///     ])
-    ///     .filters("Include", &[("terminal", "terminal-only"), ("gui", "GUI-only"),
-    ///                           ("spyware", "privacy-infringing")]);
+    ///     .filters("Include", &[
+    ///         (&["terminal", "!gui"][..], "terminal-only"),
+    ///         (&["gui", "!terminal"][..], "GUI-only"),
+    ///         (&["spyware"][..],           "privacy-infringing"),
+    ///     ]);
     ///
     /// assert!(!form.filtered_out(0, 1), "everything shows to begin with");
-    /// form.excluded.insert("spyware".into());
-    /// assert!(form.filtered_out(0, 1), "…and clearing spyware removes it, gui tag or not");
-    /// assert!(!form.filtered_out(0, 0), "ripgrep carries neither tag");
+    ///
+    /// // Clearing an exclusion box removes what it governs, other tags notwithstanding.
+    /// form.excluded.insert("privacy-infringing".into());
+    /// assert!(form.filtered_out(0, 1), "zoom goes, gui tag or not");
+    /// assert!(!form.filtered_out(0, 0), "ripgrep is governed by neither");
+    ///
+    /// // And the negative half: zoom is gui AND terminal-less, so GUI-only governs it too…
+    /// form.excluded.clear();
+    /// form.excluded.insert("GUI-only".into());
+    /// assert!(form.filtered_out(0, 1));
+    /// // …while terminal-only does not touch it.
+    /// form.excluded.clear();
+    /// form.excluded.insert("terminal-only".into());
+    /// assert!(!form.filtered_out(0, 1), "zoom is not terminal-only");
+    /// assert!(form.filtered_out(0, 0), "ripgrep is");
     /// ```
-    pub fn filters(mut self, label: impl Into<String>, tags: &[(&str, &str)]) -> Self {
+    pub fn filters(mut self, label: impl Into<String>, boxes: &[(&[&str], &str)]) -> Self {
         self.filter_label = label.into();
-        self.filters = tags.iter().map(|(tag, said)| ((*tag).to_string(), (*said).to_string())).collect();
+        self.filters = boxes.iter().map(|(terms, said)| Rule::of(*said, terms)).collect();
         self
     }
 
@@ -519,8 +596,14 @@ impl Form {
     /// Whether slot `slot` of item `index` carries a tag the user has cleared.
     #[must_use]
     pub fn filtered_out(&self, index: usize, slot: usize) -> bool {
-        !self.excluded.is_empty()
-            && self.tags_at(index, slot).iter().any(|tag| self.excluded.contains(tag))
+        if self.excluded.is_empty() {
+            return false;
+        }
+        let tags = self.tags_at(index, slot);
+        self.filters
+            .iter()
+            .filter(|rule| self.excluded.contains(&rule.label))
+            .any(|rule| rule.matches(tags))
     }
 
     /// Make the sub-titles fold (see `collapsible`). Every section opens expanded.

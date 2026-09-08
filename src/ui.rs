@@ -260,9 +260,10 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
             // A filter box ticks and unticks like any other — what differs is that it changes
             // which OTHER rows exist, so the cursor is re-found afterwards by identity.
             if let Focus::Filter { at } = rows[*focus] {
-                let Some((tag, _)) = form.filters.get(at).cloned() else { return Action::Ignored };
-                if !form.excluded.remove(&tag) {
-                    form.excluded.insert(tag);
+                let Some(rule) = form.filters.get(at) else { return Action::Ignored };
+                let label = rule.label.clone();
+                if !form.excluded.remove(&label) {
+                    form.excluded.insert(label);
                 }
                 let here = Focus::Filter { at };
                 if let Some(now) = focusables(form).iter().position(|row| *row == here) {
@@ -601,12 +602,12 @@ pub(crate) fn render(
         if !form.filter_label.is_empty() {
             lines.push(violet(format!("{}:", form.filter_label)));
         }
-        for (at, (tag, said)) in form.filters.iter().enumerate() {
-            let box_mark = if form.excluded.contains(tag) { "[ ]" } else { "[x]" };
+        for (at, rule) in form.filters.iter().enumerate() {
+            let box_mark = if form.excluded.contains(&rule.label) { "[ ]" } else { "[x]" };
             // Coloured BEFORE the focus mark, so the re-arming below carries the violet's own
             // reset through the reverse video instead of being cut short by it — the same order
             // the cleared-box red is applied in.
-            let row = violet(format!("{box_mark} {said}"));
+            let row = violet(format!("{box_mark} {}", rule.label));
             lines.push(match rows.get(focus) == Some(&Focus::Filter { at }) {
                 true => format!("\x1b[7m▸ {}\x1b[0m", row.replace("\x1b[0m", "\x1b[0m\x1b[7m")),
                 false => format!("  {row}"),
@@ -1147,7 +1148,7 @@ pub fn run_with_warnings(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Choice, Condition, GridCell, GridRow};
+    use crate::{Choice, Condition, GridCell, GridRow, Rule};
 
     fn form() -> Form {
         Form::new()
@@ -1888,7 +1889,12 @@ mod tests {
             )
             .filters(
                 "Include",
-                &[("terminal", "terminal-only"), ("gui", "GUI-only"), ("spyware", "spyware")],
+                &[
+                    // The negative half is the point: a row carrying BOTH is neither.
+                    (&["terminal", "!gui"][..], "terminal-only"),
+                    (&["gui", "!terminal"][..], "GUI-only"),
+                    (&["spyware"][..], "spyware"),
+                ],
             )
     }
 
@@ -1959,6 +1965,66 @@ mod tests {
         assert!(!lines.iter().any(|line| line.contains("zoom")), "{lines:#?}");
         assert!(lines.iter().any(|line| line.contains("ripgrep")), "{lines:#?}");
         assert!(lines.iter().any(|line| line.contains("mystery")), "{lines:#?}");
+    }
+
+    /// The case a tag-per-box cannot express, and the reason rules exist.
+    ///
+    /// Something carrying BOTH `terminal` and `gui` is neither terminal-only nor GUI-only, so
+    /// clearing either box must leave it alone. Under the old one-tag scheme it vanished from
+    /// both — the wrong answer twice, and invisibly, since the row simply was not there to argue
+    /// with.
+    #[test]
+    fn an_entry_carrying_both_tags_is_governed_by_neither_only_box() {
+        let row = |label: &str, tags: &[&str]| GridRow {
+            label: label.into(),
+            heading: None,
+            note: None,
+            cells: vec![GridCell::open(None)],
+            tags: tags.iter().map(|t| (*t).to_string()).collect(),
+        };
+        let mut form = Form::new()
+            .grid(
+                "packages",
+                &["apt"],
+                vec![
+                    row("ripgrep", &["terminal"]),
+                    row("firefox", &["gui"]),
+                    row("code", &["terminal", "gui"]), // ships both a CLI and a window
+                ],
+            )
+            .filters(
+                "Include",
+                &[(&["terminal", "!gui"][..], "terminal-only"), (&["gui", "!terminal"][..], "GUI-only")],
+            );
+
+        form.excluded.insert("terminal-only".into());
+        assert!(form.filtered_out(0, 0), "ripgrep is terminal and not gui");
+        assert!(!form.filtered_out(0, 1), "firefox is untouched by the terminal box");
+        assert!(!form.filtered_out(0, 2), "and so is the one that is both");
+
+        // Clear BOTH boxes. The pure ones go; the one that is both survives, which is the whole
+        // distinction — "only" is a claim about what a thing is NOT.
+        form.excluded.insert("GUI-only".into());
+        assert!(form.filtered_out(0, 0));
+        assert!(form.filtered_out(0, 1));
+        assert!(!form.filtered_out(0, 2), "neither box governs it, so nothing hides it");
+        let lines = drawn(&form);
+        assert!(lines.iter().any(|line| line.contains("code")), "{lines:#?}");
+    }
+
+    /// `!` is read once, at construction, and splits the terms into the two lists.
+    #[test]
+    fn a_rule_reads_its_negations_when_it_is_built() {
+        let rule = Rule::of("terminal-only", &["terminal", "!gui", "!legacy"]);
+        assert_eq!(rule.all_of, ["terminal"]);
+        assert_eq!(rule.none_of, ["gui", "legacy"]);
+        assert!(rule.matches(&["terminal".into()]));
+        assert!(!rule.matches(&["terminal".into(), "legacy".into()]), "any forbidden tag is enough");
+        assert!(!rule.matches(&[]), "a positive term must actually be there");
+        // Several positives all have to hold.
+        let both = Rule::of("both", &["terminal", "gui"]);
+        assert!(both.matches(&["terminal".into(), "gui".into()]));
+        assert!(!both.matches(&["terminal".into()]));
     }
 
     /// Hiding a row is not answering for it: a filtered entry keeps every tick it had, and comes
@@ -2034,8 +2100,9 @@ mod tests {
     fn filtering_and_folding_are_independent() {
         let mut plain = tagged();
         let mut folding = tagged().collapsible();
-        plain.excluded.insert("terminal".into());
-        folding.excluded.insert("terminal".into());
+        // Keyed by the BOX's wording now, not by a tag — a rule is not a tag.
+        plain.excluded.insert("terminal-only".into());
+        folding.excluded.insert("terminal-only".into());
         assert!(!drawn(&plain).iter().any(|line| line.contains("ripgrep")), "filter alone");
         assert!(!drawn(&folding).iter().any(|line| line.contains("ripgrep")), "and with folding");
 
