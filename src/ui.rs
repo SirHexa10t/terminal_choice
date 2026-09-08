@@ -22,6 +22,17 @@ pub(crate) enum Focus {
     Option { item: usize, option: usize },
     /// Cell `column` of row `row` of the grid at `item`.
     Cell { item: usize, row: usize, column: usize },
+    /// A foldable sub-title of `item`, standing above `slot`. Only ever present while
+    /// [`Form::collapsible`] is set.
+    ///
+    /// `foot` distinguishes the two rows an OPEN section draws: the `v` above its options and the
+    /// `^` below them. Both fold it, which is the point — a section long enough to want folding
+    /// is long enough that scrolling back to its top to do so is a nuisance. A shut section draws
+    /// one row, `>`, and that one is never the foot.
+    Section { item: usize, slot: usize, foot: bool },
+    /// Tick-box `at` of the filter block — see [`Form::filters`]. Above every item, because it
+    /// governs all of them.
+    Filter { at: usize },
     /// The text field at `item`.
     Text { item: usize },
     /// The final `[ Submit ]` row.
@@ -45,15 +56,22 @@ impl Opened {
     ///
     /// Two dimensions throughout, so a grid and a checkbox group are read the same way: a
     /// checkbox group is simply a table one row deep.
+    /// A SUGGESTED tick is recorded as clear, which is the whole of what makes a suggestion one.
+    /// The form arrived showing it, but it asserts nothing — so declining it is an ordinary
+    /// answer, not the undoing of a fact, and nothing here has anything to mark.
     pub(crate) fn of(form: &Form) -> Self {
         Self(
             form.items
                 .iter()
                 .map(|item| match item {
-                    Item::Checkboxes { checked, .. } => vec![checked.clone()],
+                    Item::Checkboxes { options, .. } => {
+                        vec![options.iter().map(|o| o.checked && !o.suggested).collect()]
+                    }
                     Item::Grid { rows, .. } => rows
                         .iter()
-                        .map(|row| row.cells.iter().map(|cell| cell.checked).collect())
+                        .map(|row| {
+                            row.cells.iter().map(|cell| cell.checked && !cell.suggested).collect()
+                        })
                         .collect(),
                     _ => Vec::new(),
                 })
@@ -69,39 +87,73 @@ impl Opened {
     }
 }
 
+/// The fold row, if any, that belongs immediately before slot `slot` of `item` (`foot` false) or
+/// immediately after it (`foot` true).
+///
+/// One function for both ends so the head and the foot can never drift apart: a section draws a
+/// `^` exactly when it drew a `v`, at exactly the slot its section runs out. Yields nothing at
+/// all unless the form folds, which is what keeps every existing form's focus list identical.
+fn _folds(form: &Form, item: usize, slot: usize, foot: bool) -> Option<Focus> {
+    if !form.collapsible {
+        return None;
+    }
+    let head = match foot {
+        // The `v`/`>` sits above the slot that carries the heading.
+        false => form.heading_at(item, slot).is_some().then_some(slot),
+        // The `^` sits after the last slot of an OPEN section. A shut one drew no options, so
+        // there is nothing for a closing marker to close.
+        true => form
+            .section_head(item, slot)
+            .filter(|head| !form.collapsed.contains(&(item, *head)))
+            .filter(|head| form.section_tail(item, *head) == slot),
+    }?;
+    // A section the filter emptied is not drawn at all — heading, markers and everything. A
+    // control that folds nothing away is worse than no control.
+    if form.section_emptied(item, head) {
+        return None;
+    }
+    Some(Focus::Section { item, slot: head, foot })
+}
+
 /// The focusable rows of `form`, in display order, always ending with Submit.
 pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
-    let mut rows = Vec::new();
+    let mut rows: Vec<Focus> =
+        (0..form.filters.len()).map(|at| Focus::Filter { at }).collect();
     for (index, item) in form.items.iter().enumerate() {
         match item {
             Item::Comment(_) => {}
             // A disabled option gets no row, which IS the "not selectable" guarantee — the same
             // way a comment's absence here is what makes comments unreachable. Nothing downstream
-            // needs to check: no key can name a row that does not exist.
-            Item::Checkboxes { enabled, .. } | Item::Radio { enabled, .. } => {
-                rows.extend(
-                    enabled
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, on)| **on)
-                        .map(|(option, _)| Focus::Option { item: index, option }),
-                );
+            // needs to check: no key can name a row that does not exist. A folded option is
+            // absent for the same reason, and the cursor cannot land on what is not drawn.
+            Item::Checkboxes { options, .. } | Item::Radio { options, .. } => {
+                for (option, entry) in options.iter().enumerate() {
+                    rows.extend(_folds(form, index, option, false));
+                    if entry.enabled && !form.hidden(index, option) {
+                        rows.push(Focus::Option { item: index, option });
+                    }
+                    rows.extend(_folds(form, index, option, true));
+                }
             }
             Item::Text { .. } => rows.push(Focus::Text { item: index }),
             // Row-major, so the flat order reads the way the table does — and so stepping one
-            // place left or right lands in the neighbouring column of the same row.
+            // place left or right lands in the neighbouring live column of the same row.
             //
-            // Every BOX gets a row, including a locked one. Unlike a checkbox, a locked cell is
-            // worth resting on: it is the form saying "this could be had, but not yet", and the
-            // preview under it is what that would take. Skipping them would also make sideways
-            // movement do nothing on any row with a single live column, which is most of them on
-            // a machine with one package manager. `enabled` is enforced where it belongs — on
-            // the key that would change something.
+            // Only cells that can be CHANGED get a row. A locked box is skipped: it is drawn so
+            // a reader can see the choice exists, not so the cursor has to walk past it — with
+            // ten columns and two of them live, stopping on the other eight is eight keystrokes
+            // to reach nothing.
             Item::Grid { rows: grid, .. } => {
                 for (row, entry) in grid.iter().enumerate() {
-                    rows.extend(entry.cells.iter().enumerate().filter(|(_, cell)| cell.boxed).map(
-                        |(column, _)| Focus::Cell { item: index, row, column },
-                    ));
+                    rows.extend(_folds(form, index, row, false));
+                    if !form.hidden(index, row) {
+                        rows.extend(
+                            entry.cells.iter().enumerate().filter(|(_, cell)| cell.enabled).map(
+                                |(column, _)| Focus::Cell { item: index, row, column },
+                            ),
+                        );
+                    }
+                    rows.extend(_folds(form, index, row, true));
                 }
             }
         }
@@ -149,9 +201,9 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
             let mut boxes = 0;
             let mut ticked = 0;
             for item in &form.items {
-                if let Item::Checkboxes { checked, enabled, .. } = item {
-                    boxes += enabled.iter().filter(|on| **on).count();
-                    ticked += checked.iter().zip(enabled).filter(|(on, live)| **on && **live).count();
+                if let Item::Checkboxes { options, .. } = item {
+                    boxes += options.iter().filter(|o| o.enabled).count();
+                    ticked += options.iter().filter(|o| o.checked && o.enabled).count();
                 }
             }
             if boxes == 0 {
@@ -159,11 +211,9 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
             }
             let everything_on = ticked == boxes;
             for item in &mut form.items {
-                if let Item::Checkboxes { checked, enabled, .. } = item {
-                    for (on, live) in checked.iter_mut().zip(enabled) {
-                        if *live {
-                            *on = !everything_on;
-                        }
+                if let Item::Checkboxes { options, .. } = item {
+                    for entry in options.iter_mut().filter(|o| o.enabled) {
+                        entry.checked = !everything_on;
                     }
                 }
             }
@@ -172,6 +222,21 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
         // down moves between rows keeping as near the same column as that row allows. Outside
         // one, and when a grid has no further row that way, they fall back to walking the flat
         // list — which is how the cursor gets out of a table and down to Submit.
+        // On a fold row the arrows do what they do in every tree: left shuts, right opens. They
+        // are free to — sideways movement means nothing on a row that is not in a grid — and it
+        // spares the one-key ambiguity of space having to guess which way you meant.
+        Key::ArrowLeft | Key::ArrowRight if matches!(rows[*focus], Focus::Section { .. }) => {
+            let Focus::Section { item, slot, .. } = rows[*focus] else { unreachable!() };
+            let shut = key == Key::ArrowLeft;
+            let changed = match shut {
+                true => form.collapsed.insert((item, slot)),
+                false => form.collapsed.remove(&(item, slot)),
+            };
+            if !changed {
+                return Action::Ignored; // already that way
+            }
+            _refocus_fold(form, focus, item, slot, shut);
+        }
         Key::ArrowLeft | Key::ArrowRight => {
             let forward = key == Key::ArrowRight;
             match _along_row(form, rows, *focus, forward) {
@@ -192,6 +257,28 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
             _ => *focus = (*focus + 1) % rows.len(),
         },
         Key::Char(' ') if !editing_text => {
+            // A filter box ticks and unticks like any other — what differs is that it changes
+            // which OTHER rows exist, so the cursor is re-found afterwards by identity.
+            if let Focus::Filter { at } = rows[*focus] {
+                let Some((tag, _)) = form.filters.get(at).cloned() else { return Action::Ignored };
+                if !form.excluded.remove(&tag) {
+                    form.excluded.insert(tag);
+                }
+                let here = Focus::Filter { at };
+                if let Some(now) = focusables(form).iter().position(|row| *row == here) {
+                    *focus = now;
+                }
+                return Action::Redraw;
+            }
+            // A fold row has nothing to tick, so space means the only thing it could: flip it.
+            if let Focus::Section { item, slot, .. } = rows[*focus] {
+                let shut = form.collapsed.insert((item, slot));
+                if !shut {
+                    form.collapsed.remove(&(item, slot));
+                }
+                _refocus_fold(form, focus, item, slot, shut);
+                return Action::Redraw;
+            }
             if let Focus::Cell { item, row, column } = rows[*focus] {
                 if let Item::Grid { rows: grid, .. } = &mut form.items[item] {
                     let cell = &mut grid[row].cells[column];
@@ -206,10 +293,10 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
             if let Focus::Option { item, option } = rows[*focus] {
                 let mut mirror: Option<(String, bool)> = None;
                 match &mut form.items[item] {
-                    Item::Checkboxes { options, checked, .. } => {
-                        checked[option] = !checked[option];
+                    Item::Checkboxes { options, .. } => {
+                        options[option].checked = !options[option].checked;
                         if form.mirror_duplicates {
-                            mirror = Some((options[option].clone(), checked[option]));
+                            mirror = Some((options[option].name.clone(), options[option].checked));
                         }
                     }
                     // A radio picks; it does not un-pick — that's what makes it a radio.
@@ -220,13 +307,11 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
                 // every group at once — a thing cannot be both doomed and spared.
                 if let Some((name, state)) = mirror {
                     for item in &mut form.items {
-                        if let Item::Checkboxes { options, checked, enabled, .. } = item {
-                            for (slot, text) in options.iter().enumerate() {
-                                // A twin the user cannot touch is not moved by touching its
-                                // sibling either — "not yours to change" holds from every angle.
-                                if *text == name && enabled[slot] {
-                                    checked[slot] = state;
-                                }
+                        if let Item::Checkboxes { options, .. } = item {
+                            // A twin the user cannot touch is not moved by touching its sibling
+                            // either — "not yours to change" holds from every angle.
+                            for twin in options.iter_mut().filter(|o| o.name == name && o.enabled) {
+                                twin.checked = state;
                             }
                         }
                     }
@@ -256,6 +341,104 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
     Action::Redraw
 }
 
+/// Whether a keystroke is ALREADY waiting to be read — asked, not waited on.
+///
+/// The same `poll` as [`_await_input`] with a zero timeout, which is the whole difference: that
+/// one blocks until there is news, this one reports whether there is any right now.
+fn _input_pending(fd: std::os::fd::RawFd) -> bool {
+    let mut watch = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    // SAFETY: as `_await_input` — `poll` touches only the pollfd on this stack frame. A zero
+    // timeout cannot block.
+    unsafe { libc::poll(&mut watch, 1, 0) > 0 && watch.revents & libc::POLLIN != 0 }
+}
+
+/// How many keystrokes may be folded into one frame before painting anyway.
+///
+/// Insurance rather than tuning. The drain ends on its own the moment the terminal has nothing
+/// waiting, and reading a key is microseconds against milliseconds to paint — so a human, even
+/// leaning on an arrow key, can never outrun it. What this bounds is the pathological case: a
+/// paste, or a terminal replaying a long escape burst, where input arrives faster than any
+/// reader. Without it, such a stream could hold the screen still indefinitely.
+const COALESCE: usize = 128;
+
+/// Whether to swallow the repaint this key earned, because more input is already waiting.
+///
+/// Pure, so the one rule that must never bend can be tested: SUBMIT AND CANCEL ARE NEVER
+/// SWALLOWED. They end the run, and a run that ended is not waiting for a tidier moment.
+fn _coalesce(action: &Action, pending: bool, drained: usize) -> bool {
+    matches!(action, Action::Redraw) && pending && drained < COALESCE
+}
+
+/// Paint `lines` over the frame already on screen, which was `previous` lines tall.
+///
+/// One write, and no blank state in between. Both matter, and for different reasons.
+///
+/// ONE WRITE, because `Term::stderr()` is unbuffered: every `write_line`, every `clear_line`,
+/// every cursor move is its own `write(2)`. The obvious repaint — clear the old block, print the
+/// new one — costs `3n + 2` of them, which is 122 syscalls for a 40-line form and 242 for an
+/// 80-line one. A terminal renders as those arrive, so the user watches the block blank line by
+/// line and fill line by line. That is the flicker. A buffered [`Term`] plus one flush makes the
+/// whole frame a single write, and the terminal has nothing to show halfway through.
+///
+/// NO BLANK STATE, because "erase n lines, then draw n lines" describes an empty screen even
+/// when it arrives in one piece. Each line is instead overwritten where it stands and followed
+/// by `\x1b[K`, which clears only whatever the old line left to the right of it. Nothing is ever
+/// blank, so nothing can be caught blank.
+///
+/// The cursor starts and finishes immediately after the block, which is what lets the next call
+/// find it by moving up `previous` lines.
+fn _paint(term: &Term, lines: &[String], previous: usize) -> std::io::Result<()> {
+    term.write_str(&_frame(lines, previous))?;
+    term.flush()
+}
+
+/// The bytes one repaint sends, as a single string — pure, so the escape arithmetic can be
+/// tested without a terminal like everything else that decides what appears.
+///
+/// Built whole before anything is written, which makes the single write a property of this
+/// function rather than a hope about the buffer underneath it.
+///
+/// The cursor ends `lines.len()` rows below where the old block began — that is, immediately
+/// after the new one — which is the invariant the next call depends on. An empty frame therefore
+/// leaves it exactly where the block started, having erased the lot.
+fn _frame(lines: &[String], previous: usize) -> String {
+    let mut out = String::new();
+    if previous > 0 {
+        out.push_str(&format!("\x1b[{previous}A"));
+    }
+    for line in lines {
+        out.push_str(line);
+        // Erase only what the old line left to the RIGHT of this one. Nothing is ever blanked
+        // first, so no repaint can be caught halfway.
+        out.push_str("\x1b[K\n");
+    }
+    // A frame that SHRANK — a section folded, a warning stopped applying — leaves rows of the
+    // old one below it. Wipe those, then come back to sit just under the new frame.
+    let surplus = previous.saturating_sub(lines.len());
+    for _ in 0..surplus {
+        out.push_str("\x1b[K\n");
+    }
+    if surplus > 0 {
+        out.push_str(&format!("\x1b[{surplus}A"));
+    }
+    out
+}
+
+/// Put the cursor back on the section that was just folded or unfolded.
+///
+/// Folding removes rows and unfolding adds them, so the index the cursor held is about to name a
+/// different row. It is re-found by IDENTITY rather than arithmetic: the head row of the same
+/// section, in the list as it now stands.
+///
+/// Always the head, even when the foot is what was pressed. A shut section has no foot to return
+/// to, and after a long section folds upward the head is where the eye already is.
+fn _refocus_fold(form: &Form, focus: &mut usize, item: usize, slot: usize, _shut: bool) {
+    let head = Focus::Section { item, slot, foot: false };
+    if let Some(at) = focusables(form).iter().position(|row| *row == head) {
+        *focus = at;
+    }
+}
+
 /// The next focusable cell along the SAME grid row, in the given direction — `None` when the
 /// cursor is not in a grid, or has run out of row.
 ///
@@ -276,9 +459,9 @@ fn _along_row(form: &Form, rows: &[Focus], focus: usize, forward: bool) -> Optio
 /// The focusable cell nearest the current column, one grid row up or down — `None` when the
 /// cursor is not in a grid, or the grid has no further row that way.
 ///
-/// Rows with no box at all are stepped over rather than stopping the cursor, and the landing
-/// column is the nearest BOX to where the cursor already was: a table that threw the cursor back
-/// to column one on every vertical move would be unusable with ten columns.
+/// Rows with nothing live are stepped over rather than stopping the cursor, and the landing
+/// column is the nearest CHANGEABLE cell to where the cursor already was: a table that threw the
+/// cursor back to column one on every vertical move would be unusable with ten columns.
 fn _across_rows(form: &Form, rows: &[Focus], focus: usize, down: bool) -> Option<usize> {
     let Focus::Cell { item, row, column } = rows[focus] else { return None };
     let Item::Grid { rows: grid, .. } = &form.items[item] else { return None };
@@ -294,7 +477,7 @@ fn _across_rows(form: &Form, rows: &[Focus], focus: usize, down: bool) -> Option
             .cells
             .iter()
             .enumerate()
-            .filter(|(_, cell)| cell.boxed)
+            .filter(|(_, cell)| cell.enabled)
             .min_by_key(|(at, _)| (at.abs_diff(column), *at))
             .map(|(at, _)| at);
         if let Some(landing) = nearest {
@@ -410,6 +593,27 @@ pub(crate) fn render(
         lines.push(console::style(title).bold().to_string());
         lines.push(String::new());
     }
+    // The filter block, above everything it governs. Drawn here rather than as an `Item` on
+    // purpose: it is not an answer, and an item would put it in `answers_toml` alongside the
+    // things the user was actually asked.
+    if !form.filters.is_empty() {
+        let violet = |text: String| console::style(text).color256(FILTER_VIOLET).to_string();
+        if !form.filter_label.is_empty() {
+            lines.push(violet(format!("{}:", form.filter_label)));
+        }
+        for (at, (tag, said)) in form.filters.iter().enumerate() {
+            let box_mark = if form.excluded.contains(tag) { "[ ]" } else { "[x]" };
+            // Coloured BEFORE the focus mark, so the re-arming below carries the violet's own
+            // reset through the reverse video instead of being cut short by it — the same order
+            // the cleared-box red is applied in.
+            let row = violet(format!("{box_mark} {said}"));
+            lines.push(match rows.get(focus) == Some(&Focus::Filter { at }) {
+                true => format!("\x1b[7m▸ {}\x1b[0m", row.replace("\x1b[0m", "\x1b[0m\x1b[7m")),
+                false => format!("  {row}"),
+            });
+        }
+        lines.push(String::new());
+    }
     // Content may carry its own colours (a caller highlighting matches). Scrubbed here when
     // asked; otherwise kept — which obliges the focus style below to survive them: an embedded
     // reset (`\x1b[0m`) would end the reverse-video mid-row, so every reset re-arms it.
@@ -435,42 +639,64 @@ pub(crate) fn render(
                     );
                 }
             }
-            Item::Checkboxes { label, options, checked, headings, enabled } => {
+            Item::Checkboxes { label, options } => {
                 // An anonymous group draws no heading — it exists to sit flush inside
                 // surrounding comments (a tree of rows, some of them tickable).
                 if !label.is_empty() {
                     lines.push(format!("{label}:"));
                 }
-                for (option, name) in options.iter().enumerate() {
-                    lines.extend(subtitle(headings, option, comment_indent, &clean));
-                    let box_mark = if checked[option] { "[x]" } else { "[ ]" };
-                    let row = format!("{box_mark} {}", clean(name.clone()));
-                    // Red BEFORE the focus mark, so that `mark`'s re-arming carries the colour's
-                    // reset through the reverse video rather than being cut short by it.
-                    let row = match opened.cleared(index, 0, option, checked[option]) {
-                        true => console::style(row).red().to_string(),
-                        false => row,
+                for (option, entry) in options.iter().enumerate() {
+                    match form.collapsible {
+                        true => lines.extend(_fold_lines(form, index, option, false, rows, focus, &clean)),
+                        false => lines.extend(subtitle(&entry.heading, comment_indent, &clean)),
+                    }
+                    if form.hidden(index, option) {
+                        lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
+                        continue;
+                    }
+                    let box_mark = if entry.checked { "[x]" } else { "[ ]" };
+                    let row = format!("{box_mark} {}", clean(entry.name.clone()));
+                    // Colour BEFORE the focus mark, so that `mark`'s re-arming carries its reset
+                    // through the reverse video rather than being cut short by it.
+                    //
+                    // The two can never both apply: red means a tick was cleared, blue means one
+                    // is still standing, and `Opened` records a suggestion as clear so a cleared
+                    // suggestion is not red either.
+                    let hinted = entry.checked && entry.suggested;
+                    let row = match (opened.cleared(index, 0, option, entry.checked), hinted) {
+                        (true, _) => console::style(row).red().to_string(),
+                        (_, true) => console::style(row).color256(SUGGESTED_BLUE).to_string(),
+                        _ => row,
                     };
-                    lines.push(match enabled[option] {
+                    lines.push(match entry.enabled {
                         // Dim, and never marked: the focus list has no row for it, so `mark`
                         // could not report it focused anyway — this only says so visibly.
                         false => console::style(format!("  {row}")).dim().to_string(),
                         true => mark(row, Focus::Option { item: index, option }),
                     });
+                    lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
                 }
             }
-            Item::Radio { label, options, chosen, headings, enabled } => {
+            Item::Radio { label, options, chosen } => {
                 if !label.is_empty() {
                     lines.push(format!("{label}:"));
                 }
-                for (option, name) in options.iter().enumerate() {
-                    lines.extend(subtitle(headings, option, comment_indent, &clean));
+                for (option, entry) in options.iter().enumerate() {
+                    match form.collapsible {
+                        true => lines.extend(_fold_lines(form, index, option, false, rows, focus, &clean)),
+                        false => lines.extend(subtitle(&entry.heading, comment_indent, &clean)),
+                    }
+                    if form.hidden(index, option) {
+                        lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
+                        continue;
+                    }
                     let dot = if *chosen == Some(option) { "(•)" } else { "( )" };
-                    let row = format!("{dot} {}", clean(name.clone()));
-                    lines.push(match enabled[option] {
+                    let row = format!("{dot} {}", clean(entry.name.clone()));
+                    lines.push(match entry.enabled {
                         false => console::style(format!("  {row}")).dim().to_string(),
                         true => mark(row, Focus::Option { item: index, option }),
                     });
+                    lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
                 }
             }
             Item::Text { label, value } => {
@@ -484,6 +710,24 @@ pub(crate) fn render(
                 // one `nix-env` would otherwise push every other column three spaces apart. No
                 // abbreviating either — the heading is the only place a column says which it is,
                 // and `nix` cut to three characters is a different manager from `nix-env`.
+                //
+                // Aligned by hand rather than by `table_formatter`, which is the sibling crate
+                // that exists for exactly this and is what bashrs uses for every other table.
+                // Measured before deciding: it would take this crate from 15 dependencies to 45
+                // — clap, rayon, regex, syn — to replace the six lines below, and `console` is
+                // already here and already counts display width with ANSI and wide glyphs
+                // handled, which is the only hard part.
+                //
+                // The shapes also fit worse than they look. That crate aligns text it splits on
+                // two-space runs; a grid has fixed-width boxes and varying headings, so cells
+                // would have to be serialised into a delimited string, re-measured, and parsed
+                // back — with the focus reverse-video and the red deviation marks riding inside
+                // them. Two of its defaults would need turning off besides (`reasonable-spacing`
+                // must never drop a grid row, and the trailing pad is deliberate so the `#`
+                // notes line up).
+                //
+                // Revisit if this crate ever gains `table_formatter` for another reason: the
+                // objection is the dependency, not the idea.
                 let pad = |text: &str, width: usize| {
                     " ".repeat(width.saturating_sub(console::measure_text_width(text)))
                 };
@@ -491,12 +735,22 @@ pub(crate) fn render(
                     .iter()
                     .map(|column| console::measure_text_width(column).max(BOX) + GAP)
                     .collect();
+                // A grid's rows carry no row-level focus marker — the reverse video goes on the
+                // cell — so they normally start flush. A folding grid has fold rows among them
+                // that DO need that two-column marker slot, so the whole table steps right to
+                // meet them, header included. Uniform, and the columns stay square.
+                //
+                // Deliberately a step and not a NEST: the mockup indents a section's contents
+                // under its title, which a grid cannot do without moving its boxes out from
+                // under its column headings. The `v`/`^` pair is what delimits a section here,
+                // which is the job that pair was invented for.
+                let lead = if form.collapsible { "  " } else { "" };
                 let heads: String = columns
                     .iter()
                     .zip(&slots)
                     .map(|(column, slot)| format!("{column}{}", pad(column, *slot)))
                     .collect();
-                lines.push(console::style(heads).dim().to_string());
+                lines.push(console::style(format!("{lead}{heads}")).dim().to_string());
 
                 // Labels align into a column, so the notes after them do too — a ragged right
                 // edge of `#` remarks is harder to read past than no remarks at all.
@@ -506,11 +760,26 @@ pub(crate) fn render(
                     .max()
                     .unwrap_or(0);
                 for (row, entry) in grid.iter().enumerate() {
-                    lines.extend(subtitle(std::slice::from_ref(&entry.heading), 0, "", &clean));
+                    match form.collapsible {
+                        true => lines.extend(_fold_lines(form, index, row, false, rows, focus, &clean)),
+                        false => {
+                            lines.extend(subtitle(&entry.heading, "", &clean));
+                        }
+                    }
+                    if form.hidden(index, row) {
+                        lines.extend(_fold_lines(form, index, row, true, rows, focus, &clean));
+                        continue;
+                    }
                     let boxes: String = entry
                         .cells
                         .iter()
                         .enumerate()
+                        // A row may carry fewer cells than there are columns — that is documented,
+                        // and the rest draw blank. It may also carry MORE, which nothing forbids
+                        // and which used to index `slots` off the end and panic mid-render.
+                        // There is no column to draw them in, so they are dropped, exactly as
+                        // `answers_toml` already drops them.
+                        .take(columns.len())
                         .map(|(column, cell)| {
                             let drawn = match cell.checked {
                                 true => "[x]",
@@ -522,12 +791,23 @@ pub(crate) fn render(
                                 // Nothing this column could ever do for this row.
                                 (false, _) => console::style(" · ").dim().to_string(),
                                 // A choice that exists but is out of reach — shown as the box it
-                                // is, so a reader can see what setting something up would unlock.
-                                (true, false) => console::style(drawn).dim().to_string(),
-                                (true, true) => match opened.cleared(index, row, column, cell.checked) {
-                                    true => console::style(drawn).red().to_string(),
-                                    false => drawn.to_string(),
-                                },
+                                // is, so a reader can see what setting something up would unlock,
+                                // and dark enough that nobody mistakes it for one they can pick.
+                                (true, false) => {
+                                    console::style(drawn).color256(LOCKED_GREY).to_string()
+                                }
+                                (true, true) => {
+                                    match (
+                                        opened.cleared(index, row, column, cell.checked),
+                                        cell.checked && cell.suggested,
+                                    ) {
+                                        (true, _) => console::style(drawn).red().to_string(),
+                                        (_, true) => {
+                                            console::style(drawn).color256(SUGGESTED_BLUE).to_string()
+                                        }
+                                        _ => drawn.to_string(),
+                                    }
+                                }
                             };
                             let inked = match rows[focus] == (Focus::Cell { item: index, row, column }) {
                                 true => format!("\x1b[7m{}\x1b[0m", inked.replace("\x1b[0m", "\x1b[0m\x1b[7m")),
@@ -541,7 +821,8 @@ pub(crate) fn render(
                         let gap = pad(&named, widest);
                         console::style(format!("{gap}  # {}", clean(note.clone()))).dim().to_string()
                     });
-                    lines.push(format!("{boxes}{named}{note}"));
+                    lines.push(format!("{lead}{boxes}{named}{note}"));
+                    lines.extend(_fold_lines(form, index, row, true, rows, focus, &clean));
                 }
             }
         }
@@ -574,16 +855,76 @@ pub(crate) fn render(
     lines.into_iter().map(|line| console::truncate_str(&line, width, "…").into_owned()).collect()
 }
 
+/// The marker a foldable section draws: `>` shut, `v` open, `^` closing an open one.
+///
+/// Arrows rather than a box, because these are not answers — a reader glancing down a form should
+/// never have to work out whether `[+]` is something they ticked.
+const SHUT: char = '>';
+const OPEN: char = 'v';
+const CLOSE: char = '^';
+
+/// The fold row before or after slot `slot`, drawn — or nothing, which is the usual answer.
+///
+/// Mirrors [`_folds`] exactly, and must: a marker drawn where no focus row exists could never be
+/// pressed, and a focus row with no marker would be an invisible stop for the cursor. The two are
+/// kept in step by asking the same question, so there is one definition of where a fold is.
+///
+/// Not dim, unlike an ordinary sub-title. A dim row that the cursor lands on reads as a mistake,
+/// and these are the only headings that are also controls.
+#[allow(clippy::too_many_arguments)]
+fn _fold_lines(
+    form: &Form,
+    item: usize,
+    slot: usize,
+    foot: bool,
+    rows: &[Focus],
+    focus: usize,
+    clean: &impl Fn(String) -> String,
+) -> Vec<String> {
+    let Some(here @ Focus::Section { slot: head, .. }) = _folds(form, item, slot, foot) else {
+        return Vec::new();
+    };
+    let Some(text) = form.heading_at(item, head) else { return Vec::new() };
+    let shut = form.collapsed.contains(&(item, head));
+    let arrow = match (foot, shut) {
+        (true, _) => CLOSE,
+        (false, true) => SHUT,
+        (false, false) => OPEN,
+    };
+    // A multi-line heading marks only its first line; the rest are continuation, and four arrows
+    // down the left of one title would read as four sections.
+    //
+    // The FOOT takes that first line and nothing else. It exists to say which section just ended,
+    // and a two-line title restated under its own options is noise where a name would do.
+    let said = clean(text.to_string());
+    let body: Vec<&str> = match foot {
+        true => said.lines().take(1).collect(),
+        false => said.lines().collect(),
+    };
+    body.into_iter()
+        .enumerate()
+        .map(|(line, said)| {
+            let lead = match line {
+                0 => format!("{arrow} "),
+                _ => "  ".to_string(),
+            };
+            match rows.get(focus) == Some(&here) && line == 0 {
+                true => format!("\x1b[7m▸ {lead}{said}\x1b[0m"),
+                false => format!("  {lead}{said}"),
+            }
+        })
+        .collect()
+}
+
 /// A sub-title standing above option `slot`, as rendered lines — dim, like a comment, because
 /// that is what it is: the file's own words about the options beneath it. Empty when the option
 /// carries none, which is most of them.
 fn subtitle(
-    headings: &[Option<String>],
-    slot: usize,
+    heading: &Option<String>,
     indent: &str,
     clean: &impl Fn(String) -> String,
 ) -> Vec<String> {
-    let Some(Some(said)) = headings.get(slot) else {
+    let Some(said) = heading else {
         return Vec::new();
     };
     said.lines()
@@ -609,6 +950,30 @@ const BOX: usize = 3;
 /// What separates one grid column from the next. Two spaces, the same gap a table uses — one
 /// leaves `guix nix-env` reading as a single word.
 const GAP: usize = 2;
+
+/// The grey a locked box is drawn in — 256-colour, deliberately darker than `dim`.
+///
+/// `dim` is whatever a terminal decides it is, and on a dark theme it lands close enough to the
+/// live boxes that a whole column of them still reads as pickable. A fixed dark grey says
+/// switched-off at a glance, which is the entire job: these are drawn so a reader can see the
+/// choice exists, and confusing them for live ones defeats that.
+const LOCKED_GREY: u8 = 240;
+
+/// The violet the filter block is drawn in — 256-colour, like [`LOCKED_GREY`] and for the same
+/// reason: a fixed colour rather than whatever a theme decides an attribute means.
+///
+/// It earns a colour of its own because it is the one block on screen that is NOT part of the
+/// answers. Everything else a user ticks is a reply to a question; these boxes only decide what
+/// they can see. Red is spoken for twice over (cautions, and a box the form arrived with that
+/// has been cleared) and grey already means switched-off, so violet is what was left unclaimed.
+const FILTER_VIOLET: u8 = 141;
+
+/// The blue a suggested tick is drawn in — 256-colour, as above.
+///
+/// Blue says "the form put this here", where an uncoloured tick says "this is already so" and a
+/// red one says "you have undone something". Three states, three colours, and the middle one is
+/// the only one that is a recommendation rather than a report.
+const SUGGESTED_BLUE: u8 = 39;
 
 /// What the focused cell would do: the line that fills it while it is empty, the line that
 /// empties it while it is full. Which way round matters — over a ticked box the interesting
@@ -697,13 +1062,14 @@ pub fn run_with_warnings(
     form: &mut Form,
     mut warn: impl FnMut(&mut Form) -> Vec<String>,
 ) -> std::io::Result<Outcome> {
-    let term = Term::stderr();
+    // BUFFERED, and the difference is the whole of the flicker: see `_paint`. Same target and
+    // same tty-ness as `Term::stderr()` — only the writes are pooled, until an explicit flush.
+    let term = Term::buffered_stderr();
     if !term.is_term() {
         return Err(std::io::Error::other(
             "interactive forms need a terminal (stderr is not one)",
         ));
     }
-    let rows = focusables(form);
     // Taken once, before a key is pressed: the whole point is to compare against what the CALLER
     // handed over, not against whatever the last repaint happened to see.
     let opened = Opened::of(form);
@@ -713,18 +1079,23 @@ pub fn run_with_warnings(
     // Raw for the whole run (drops — and restores — on every path out of this function).
     let _raw = RawMode::engage(fd)?;
     term.hide_cursor()?;
+    term.flush()?;
     let outcome = loop {
-        // Repaint only when something changed — the inner loop below eats the junk events a
-        // terminal produces (focus reports, stray escapes) without a single write.
-        term.clear_last_lines(on_screen)?;
+        // Recomputed per repaint rather than once, because folding a section adds and removes
+        // rows: a list taken before the first keypress would go stale the moment one shut.
+        let rows = focusables(form);
+        // …and a shorter list must not be indexed at the old cursor. `_refocus_fold` already
+        // moves the cursor somewhere sensible; this is the belt to its braces.
+        focus = focus.min(rows.len().saturating_sub(1));
         let width = term.size().1 as usize;
+        let mut drained = 0;
         // Asked again every repaint, so the cautions — and any emphasis the caller paints on
         // the rows — track the answers as they change.
         let notes = _notes(form, &mut warn);
         let lines = render(form, &rows, focus, width.max(20), &notes, &opened);
-        for line in &lines {
-            term.write_line(line)?;
-        }
+        // Repaint only when something changed — the inner loop below eats the junk events a
+        // terminal produces (focus reports, stray escapes) without a single write.
+        _paint(&term, &lines, on_screen)?;
         on_screen = lines.len();
         let action = loop {
             match _await_input(fd) {
@@ -735,10 +1106,24 @@ pub fn run_with_warnings(
             match term.read_key() {
                 // The terminal went away mid-question (hangup, ctrl-d): treat as walking off.
                 Err(_) => break Action::Cancel,
-                Ok(key) => match apply(form, &rows, &mut focus, key) {
-                    Action::Ignored => continue,
-                    decided => break decided,
-                },
+                Ok(key) => {
+                    // Taken fresh per KEY, not per frame: while several keys are being folded
+                    // into one repaint, any of them may fold a section and change what rows
+                    // exist. The list the next key is applied against has to know.
+                    let live = focusables(form);
+                    focus = focus.min(live.len().saturating_sub(1));
+                    let action = apply(form, &live, &mut focus, key);
+                    drained += 1;
+                    // A key that changed nothing never painted anything anyway; a key that did,
+                    // with more input already queued behind it, paints once for the whole burst.
+                    // This is what stops a held arrow key from queueing a full render each.
+                    if matches!(action, Action::Ignored)
+                        || _coalesce(&action, _input_pending(fd), drained)
+                    {
+                        continue;
+                    }
+                    break action;
+                }
             }
         };
         match action {
@@ -747,15 +1132,22 @@ pub fn run_with_warnings(
             _ => {}
         }
     };
-    term.clear_last_lines(on_screen)?;
+    // The form comes off the screen on the way out, as it always did — but through the same one
+    // write, so the last thing a user sees is not a block erasing itself a line at a time.
+    //
+    // A frame of NO lines against a block of `on_screen` is exactly what `clear_last_lines` did:
+    // every row wiped, cursor left where the form began. Calling both would erase that many
+    // lines again, above the form, taking whatever the caller had printed before it.
+    _paint(&term, &[], on_screen)?;
     term.show_cursor()?;
+    term.flush()?;
     Ok(outcome)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Condition, GridCell, GridRow};
+    use crate::{Choice, Condition, GridCell, GridRow};
 
     fn form() -> Form {
         Form::new()
@@ -786,9 +1178,9 @@ mod tests {
             "a plain run shows only what was declared"
         );
 
-        let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
-        checked[0] = true;
-        checked[1] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
+        options[1].checked = true;
         // Now only the declared one — and it shows even with an empty closure, which is what
         // `run` passes, so a TOML-defined form warns without any code at all.
         assert_eq!(_notes(&mut form, &mut supplied.clone()), ["declared: both ticked"]);
@@ -878,9 +1270,9 @@ mod tests {
     #[test]
     fn a_disabled_option_cannot_be_reached_by_any_key() {
         let mut form = Form::new().checkboxes("Tops", &["a", "b", "c"]);
-        let Item::Checkboxes { enabled, checked, .. } = &mut form.items[0] else { panic!() };
-        enabled[1] = false;
-        checked[1] = true; // it arrives ticked, and must stay ticked
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[1].enabled = false;
+        options[1].checked = true; // it arrives ticked, and must stay ticked
 
         let rows = focusables(&form);
         assert_eq!(
@@ -899,23 +1291,24 @@ mod tests {
             apply(&mut form, &rows, &mut focus, Key::Char(' '));
             apply(&mut form, &rows, &mut focus, Key::ArrowDown);
         }
-        let Item::Checkboxes { checked, .. } = &form.items[0] else { panic!() };
-        assert!(checked[1], "a fixed box keeps its state through every keystroke");
+        let Item::Checkboxes { options, .. } = &form.items[0] else { panic!() };
+        assert!(options[1].checked, "a fixed box keeps its state through every keystroke");
 
         // Ctrl+A: flips what is the user's, leaves what is not.
         let mut form = Form::new().checkboxes("Tops", &["a", "b", "c"]);
-        let Item::Checkboxes { enabled, .. } = &mut form.items[0] else { panic!() };
-        enabled[1] = false;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[1].enabled = false;
         let rows = focusables(&form);
         let mut focus = 0;
         apply(&mut form, &rows, &mut focus, Key::Home);
-        let Item::Checkboxes { checked, .. } = &form.items[0] else { panic!() };
-        assert_eq!(checked, &[true, false, true], "all-on skips the fixed box");
+        let Item::Checkboxes { options, .. } = &form.items[0] else { panic!() };
+        let ticks = |options: &[Choice]| options.iter().map(|o| o.checked).collect::<Vec<_>>();
+        assert_eq!(ticks(options), [true, false, true], "all-on skips the fixed box");
         apply(&mut form, &rows, &mut focus, Key::Home);
-        let Item::Checkboxes { checked, .. } = &form.items[0] else { panic!() };
+        let Item::Checkboxes { options, .. } = &form.items[0] else { panic!() };
         assert_eq!(
-            checked,
-            &[false, false, false],
+            ticks(options),
+            [false, false, false],
             "every box it may touch was on, so the second press clears those and only those"
         );
     }
@@ -927,17 +1320,17 @@ mod tests {
         let mut form =
             Form::new().checkboxes("Left", &["shared"]).checkboxes("Right", &["shared"]);
         form.mirror_duplicates = true;
-        let Item::Checkboxes { enabled, .. } = &mut form.items[1] else { panic!() };
-        enabled[0] = false;
+        let Item::Checkboxes { options, .. } = &mut form.items[1] else { panic!() };
+        options[0].enabled = false;
 
         let rows = focusables(&form);
         let mut focus = 0;
         apply(&mut form, &rows, &mut focus, Key::Char(' '));
 
-        let Item::Checkboxes { checked, .. } = &form.items[0] else { panic!() };
-        assert!(checked[0], "the one that was ticked");
-        let Item::Checkboxes { checked, .. } = &form.items[1] else { panic!() };
-        assert!(!checked[0], "its locked twin stayed put");
+        let Item::Checkboxes { options, .. } = &form.items[0] else { panic!() };
+        assert!(options[0].checked, "the one that was ticked");
+        let Item::Checkboxes { options, .. } = &form.items[1] else { panic!() };
+        assert!(!options[0].checked, "its locked twin stayed put");
     }
 
     /// Sub-titles draw dim above the option they belong to, and a disabled option draws dim
@@ -945,10 +1338,10 @@ mod tests {
     #[test]
     fn sub_titles_and_locked_options_are_drawn_dim() {
         let mut form = Form::new().checkboxes("Packages", &["zed", "helix", "apt"]);
-        let Item::Checkboxes { headings, enabled, .. } = &mut form.items[0] else { panic!() };
-        headings[0] = Some("dev-tools".into());
-        headings[2] = Some("system\n(not yours)".into());
-        enabled[2] = false;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].heading = Some("dev-tools".into());
+        options[2].heading = Some("system\n(not yours)".into());
+        options[2].enabled = false;
 
         let rows = focusables(&form);
         let drawn = render(&form, &rows, 0, 100, &[], &Opened::of(&form));
@@ -983,8 +1376,8 @@ mod tests {
     #[test]
     fn clearing_a_box_the_form_arrived_with_marks_it_red() {
         let mut form = Form::new().checkboxes("Settings", &["on", "off"]);
-        let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
-        checked[0] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
 
         let opened = Opened::of(&form); // taken once, as a run does
         let rows = focusables(&form);
@@ -1000,23 +1393,772 @@ mod tests {
         assert_eq!(row(&form, "off"), "  [ ] off");
 
         // Clear the one that arrived ticked.
-        let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
-        checked[0] = false;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = false;
         assert_eq!(row(&form, "on"), console::style("  [ ] on").red().to_string());
 
         // Tick the one that arrived clear: a plain answer, not a reversal.
-        let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
-        checked[1] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[1].checked = true;
         assert_eq!(row(&form, "off"), "  [x] off", "filling something in is not undoing it");
 
         // Put it back: the mark comes off as cleanly as it went on.
-        let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
-        checked[0] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
         assert_eq!(row(&form, "on"), "  [x] on");
     }
 
     /// Three managers, three packages, one unavailable everywhere but the middle — the shape the
     /// whole feature exists for. Boxes first so the columns read straight down, name after.
+    // ——— folding sections ————————————————————————————————————————————————
+    //
+    // A form with sub-titles and nothing else, so the tests below can each turn ONE thing on.
+    // `dev` covers slots 0–1, `web` covers 2–3, and slot 0 also opens the first section, which
+    // is what makes "before any heading" a case worth having: there is no such slot here, and
+    // `loose_options_never_fold` builds one that does.
+    fn sectioned() -> Form {
+        let mut form = Form::new().checkboxes("packages", &["git", "jq", "brave", "firefox"]);
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].heading = Some("dev".into());
+        options[2].heading = Some("web".into());
+        options[1].checked = true; // something ticked inside a section, for the answers test
+        form
+    }
+
+    fn drawn(form: &Form) -> Vec<String> {
+        let rows = focusables(form);
+        render(form, &rows, rows.len() - 1, 200, &[], &Opened::of(form))
+            .iter()
+            .map(|line| console::strip_ansi_codes(line).trim_end().to_string())
+            .collect()
+    }
+
+    /// The opt-in, which is the whole contract: a form that does not ask for folding is drawn and
+    /// walked exactly as it was before the feature existed.
+    #[test]
+    fn sub_titles_do_not_fold_unless_the_form_asks() {
+        let plain = sectioned();
+        let folding = sectioned().collapsible();
+
+        let flat = drawn(&plain);
+        assert!(flat.iter().any(|line| line.trim() == "dev"), "the sub-title still shows: {flat:#?}");
+        assert!(
+            !flat.iter().any(|line| line.contains('>') || line.trim_start().starts_with('v')),
+            "and carries no marker: {flat:#?}"
+        );
+        assert_eq!(focusables(&plain).len(), 5, "four options and Submit — no section rows");
+        assert_eq!(focusables(&folding).len(), 9, "…plus a v and a ^ for each of two sections");
+        // Nothing but the flag differs, so any render change is the flag's doing.
+        assert_eq!(plain.items, folding.items, "folding never rewrites the items");
+    }
+
+    /// What an open section looks like: `v` above its options, `^` after the last of them.
+    #[test]
+    fn an_open_section_is_marked_at_both_ends() {
+        let lines = drawn(&sectioned().collapsible());
+        let at = |want: &str| lines.iter().position(|line| line.trim() == want);
+        assert_eq!(
+            (at("v dev"), at("[ ] git"), at("[x] jq"), at("^ dev")),
+            (Some(1), Some(2), Some(3), Some(4)),
+            "{lines:#?}"
+        );
+        assert_eq!((at("v web"), at("^ web")), (Some(5), Some(8)), "{lines:#?}");
+    }
+
+    /// And a shut one: `>`, nothing beneath it, and no `^` — there is nothing to close.
+    #[test]
+    fn a_shut_section_hides_its_options_and_drops_its_foot() {
+        let form = sectioned().collapsible().folded(0, 0);
+        let lines = drawn(&form);
+        assert!(lines.iter().any(|line| line.trim() == "> dev"), "{lines:#?}");
+        assert!(!lines.iter().any(|line| line.contains("git")), "folded away: {lines:#?}");
+        assert!(!lines.iter().any(|line| line.contains("jq")), "folded away: {lines:#?}");
+        assert!(!lines.iter().any(|line| line.trim() == "^ dev"), "nothing to close: {lines:#?}");
+        // The other section is untouched — folding is per-section, not per-form.
+        assert!(lines.iter().any(|line| line.trim() == "v web"), "{lines:#?}");
+        assert!(lines.iter().any(|line| line.contains("brave")), "{lines:#?}");
+    }
+
+    /// The guarantee that makes folding safe: it hides a question, it does not withdraw it.
+    #[test]
+    fn folding_hides_options_without_touching_the_answers() {
+        let open = sectioned().collapsible();
+        let shut = sectioned().collapsible().folded(0, 0);
+        assert_eq!(open.checked("packages"), ["jq"]);
+        assert_eq!(shut.checked("packages"), ["jq"], "still ticked, merely out of sight");
+        assert_eq!(open.answers_toml(), shut.answers_toml(), "and identical on the way out");
+    }
+
+    /// A folded option is unreachable by the same rule as a comment or a disabled box: the focus
+    /// list has no row for it, so no key can name one.
+    #[test]
+    fn the_cursor_cannot_reach_inside_a_folded_section() {
+        let form = sectioned().collapsible().folded(0, 0);
+        let rows = focusables(&form);
+        assert!(
+            !rows.iter().any(|row| matches!(row, Focus::Option { option: 0 | 1, .. })),
+            "{rows:#?}"
+        );
+        assert!(rows.contains(&Focus::Section { item: 0, slot: 0, foot: false }), "{rows:#?}");
+        assert!(
+            !rows.contains(&Focus::Section { item: 0, slot: 0, foot: true }),
+            "a shut section has no foot"
+        );
+        // Walking the whole form with ↓ must never land on a hidden option, and must terminate.
+        let mut focus = 0;
+        let mut form = form;
+        for _ in 0..rows.len() * 2 {
+            let rows = focusables(&form);
+            assert!(!matches!(rows[focus], Focus::Option { option: 0 | 1, .. }));
+            apply(&mut form, &rows, &mut focus, Key::ArrowDown);
+        }
+    }
+
+    /// Space flips a section either way; the arrows say which way, as they do in every tree.
+    #[test]
+    fn space_toggles_a_section_and_the_arrows_pick_a_direction() {
+        let mut form = sectioned().collapsible();
+        let mut focus = 0; // the `v dev` row is first
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: false });
+
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Char(' ')), Action::Redraw);
+        assert!(form.collapsed.contains(&(0, 0)), "space shut it");
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: false }, "cursor held");
+
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::ArrowLeft), Action::Ignored);
+        assert!(form.collapsed.contains(&(0, 0)), "already shut — nothing to repaint");
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::ArrowRight), Action::Redraw);
+        assert!(!form.collapsed.contains(&(0, 0)), "right opens");
+        let rows = focusables(&form);
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::ArrowLeft), Action::Redraw);
+        assert!(form.collapsed.contains(&(0, 0)), "left shuts");
+    }
+
+    /// The foot folds too — the point of having one. Pressing it lands the cursor on the head,
+    /// because the foot it was standing on has just ceased to exist.
+    #[test]
+    fn the_closing_marker_folds_and_the_cursor_survives_it() {
+        let mut form = sectioned().collapsible();
+        let rows = focusables(&form);
+        let foot = Focus::Section { item: 0, slot: 0, foot: true };
+        let mut focus = rows.iter().position(|row| *row == foot).expect("an open section has a foot");
+
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Char(' ')), Action::Redraw);
+        assert!(form.collapsed.contains(&(0, 0)));
+        let rows = focusables(&form);
+        assert!(focus < rows.len(), "the list shortened under the cursor");
+        assert_eq!(
+            rows[focus],
+            Focus::Section { item: 0, slot: 0, foot: false },
+            "moved to the head, which is where the section now is"
+        );
+    }
+
+    /// Options standing before the first sub-title belong to no section, and nothing can fold
+    /// them away — otherwise a form could hide rows with no marker left to bring them back.
+    #[test]
+    fn loose_options_never_fold() {
+        let mut form = Form::new().checkboxes("packages", &["loose", "git"]).collapsible();
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[1].heading = Some("dev".into());
+        let form = form.folded(0, 1);
+
+        let lines = drawn(&form);
+        assert!(lines.iter().any(|line| line.contains("loose")), "outside any section: {lines:#?}");
+        assert!(!lines.iter().any(|line| line.contains("git")), "inside a shut one: {lines:#?}");
+        assert!(!form.hidden(0, 0), "no heading governs slot 0");
+        assert!(form.hidden(0, 1));
+    }
+
+    /// Grids fold on their row headings, the same way and by the same code.
+    #[test]
+    fn a_grid_folds_on_its_row_headings() {
+        let form = grid_form().collapsible();
+        let lines = drawn(&form);
+        assert!(lines.iter().any(|line| line.trim() == "v # tools"), "{lines:#?}");
+        assert!(lines.iter().any(|line| line.trim() == "^ # tools"), "{lines:#?}");
+
+        let form = grid_form().collapsible().folded(0, 1); // "# browsers", covering rows 1 and 2
+        let lines = drawn(&form);
+        assert!(lines.iter().any(|line| line.contains("git")), "other section still open");
+        assert!(!lines.iter().any(|line| line.contains("brave")), "{lines:#?}");
+        assert!(!lines.iter().any(|line| line.contains("firefox")), "a section is not one row");
+        let rows = focusables(&form);
+        assert!(!rows.iter().any(|row| matches!(row, Focus::Cell { row: 1 | 2, .. })), "{rows:#?}");
+        assert_eq!(form.answers_toml(), grid_form().answers_toml(), "answers unchanged");
+    }
+
+    /// A multi-line sub-title gets one marker, on its first line. Four arrows down the left of
+    /// one title would read as four sections.
+    #[test]
+    fn only_the_first_line_of_a_heading_is_marked() {
+        let mut form = Form::new().checkboxes("p", &["a"]).collapsible();
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].heading = Some("first\nsecond".into());
+
+        let lines = drawn(&form);
+        assert_eq!(
+            lines.iter().map(|line| line.trim()).take(5).collect::<Vec<_>>(),
+            ["p:", "v first", "second", "[ ] a", "^ first"],
+            "the head carries both lines and one arrow; the foot names the section and stops"
+        );
+        let marked = |arrow: char| {
+            lines.iter().filter(|line| line.trim_start().starts_with(arrow)).count()
+        };
+        assert_eq!((marked('v'), marked('^')), (1, 1), "one section, one of each: {lines:#?}");
+    }
+
+    /// The whole shape, in one place — a folded section and an open one, drawn together. The
+    /// other tests check pieces; this one is what a reader actually sees, and is the test that
+    /// fails if the arrangement drifts.
+    #[test]
+    fn a_folding_grid_draws_as_the_shape_it_was_asked_for() {
+        let cell = || GridCell::open(None);
+        let row = |label: &str, heading: Option<&str>| GridRow {
+            label: label.into(),
+            heading: heading.map(Into::into),
+            note: None,
+            cells: vec![cell(), cell()],
+            tags: Vec::new(),
+        };
+        let form = Form::new()
+            .collapsible()
+            .grid(
+                "",
+                &["apt", "flatpak"],
+                vec![
+                    row("firefox", Some("Browsers")),
+                    row("brave", None),
+                    row("nautilus", Some("File managers")),
+                ],
+            )
+            .folded(0, 0);
+
+        assert_eq!(
+            drawn(&form),
+            [
+                // Leading spaces kept, not trimmed: the columns ARE the assertion. Every row of
+                // a folding grid — header, fold markers, boxes — starts at the same place.
+                "  apt  flatpak",
+                "  > Browsers",
+                "  v File managers",
+                "  [ ]  [ ]      nautilus",
+                "  ^ File managers",
+                "",
+                "▸ [ Submit ]",
+                "↑/↓/←/→ move · space picks · ctrl+a all/none · enter next/submit · esc cancels",
+            ]
+        );
+        // …and without the flag, the table sits flush as it always did.
+        let plain = drawn(&Form::new().grid("", &["apt", "flatpak"], vec![row("firefox", None)]));
+        assert_eq!(plain[0], "apt  flatpak", "no marker column when nothing folds");
+    }
+
+    /// A row with more cells than the grid has columns. Nothing forbids it, `answers_toml` has
+    /// always dropped the excess, and `render` used to index off the end of the column widths and
+    /// take the whole process down mid-paint.
+    #[test]
+    fn a_row_wider_than_its_grid_draws_instead_of_panicking() {
+        let form = Form::new().grid(
+            "packages",
+            &["apt"],
+            vec![GridRow {
+                label: "git".into(),
+                heading: None,
+                note: None,
+                cells: vec![GridCell::set(None), GridCell::set(None), GridCell::set(None)],
+                tags: Vec::new(),
+            }],
+        );
+        // ["packages:", "apt", the row, …] — the label line, then the headings, then the boxes.
+        assert_eq!(drawn(&form)[2], "[x]  git", "one column drawn, the surplus dropped");
+        assert!(form.answers_toml().contains("apt"), "and the answers agree: {}", form.answers_toml());
+    }
+
+    /// Why `run` recomputes the focus list per repaint, rather than taking it once as it used to.
+    ///
+    /// Not because folding loses anything — the answers are untouched, which the test above
+    /// pins. Because the LIST is not data: it is the set of rows that exist to be landed on, and
+    /// a shut section has two fewer of them (its options) plus one less again (its `^`, which is
+    /// not drawn because there is nothing left to close).
+    ///
+    /// Held here because `run`'s loop needs a terminal, so the staleness itself cannot be tested
+    /// where it lives. This models the loop instead: take a list once, fold, and keep using it.
+    #[test]
+    fn a_stale_focus_list_would_strand_the_cursor_on_an_invisible_row() {
+        let mut form = sectioned().collapsible();
+        let stale = focusables(&form); // what a list taken once, before any key, would hold
+        let mut focus = 0;
+        assert_eq!(stale[focus], Focus::Section { item: 0, slot: 0, foot: false });
+        apply(&mut form, &stale, &mut focus, Key::Char(' '));
+        assert!(form.collapsed.contains(&(0, 0)), "the first section is now shut");
+
+        let fresh = focusables(&form);
+        assert_eq!((stale.len(), fresh.len()), (9, 6), "three rows stopped existing");
+
+        // Step down against the list as it WAS. It lands on an option inside the shut section…
+        let mut adrift = 0;
+        apply(&mut form.clone(), &stale, &mut adrift, Key::ArrowDown);
+        assert!(matches!(stale[adrift], Focus::Option { option: 0, .. }), "{:?}", stale[adrift]);
+        // …and that row is not drawn, so the cursor is nowhere on screen. This is the bug.
+        let gone = render(&form, &stale, adrift, 200, &[], &Opened::of(&form));
+        assert!(
+            !gone.iter().any(|line| line.contains('▸')),
+            "no row carries the cursor: {gone:#?}"
+        );
+
+        // Step down against a fresh list, and it lands on the next thing actually visible.
+        let mut live = 0;
+        apply(&mut form.clone(), &fresh, &mut live, Key::ArrowDown);
+        assert_eq!(fresh[live], Focus::Section { item: 0, slot: 2, foot: false });
+        let shown = render(&form, &fresh, live, 200, &[], &Opened::of(&form));
+        assert_eq!(
+            shown.iter().filter(|line| line.contains('▸')).count(),
+            1,
+            "exactly one, and it is on screen: {shown:#?}"
+        );
+    }
+
+    // ——— suggestions ——————————————————————————————————————————————————————
+
+    /// Three ticks, three meanings: one the machine already has, one the form recommends, one
+    /// empty. The middle one is the case under test.
+    fn suggested_form() -> Form {
+        let mut form = Form::new().checkboxes("packages", &["installed", "recommended", "neither"]);
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
+        options[1].checked = true;
+        options[1].suggested = true;
+        form
+    }
+
+    /// The whole of what a suggestion is: it arrives ticked, and clearing it is not a deviation.
+    /// A tick the form ASSERTED still reddens when cleared — the two directions are the point.
+    #[test]
+    fn declining_a_suggestion_is_not_marked_but_undoing_a_fact_still_is() {
+        let mut form = suggested_form();
+        let opened = Opened::of(&form); // taken once, as a run does
+        let rows = focusables(&form);
+        let row = |form: &Form, want: &str| {
+            render(form, &rows, rows.len() - 1, 80, &[], &opened)
+                .into_iter()
+                .find(|line| console::strip_ansi_codes(line).contains(want))
+                .expect("drawn")
+        };
+
+        // Clear both ticked boxes.
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = false;
+        options[1].checked = false;
+
+        assert_eq!(
+            row(&form, "installed"),
+            console::style("  [ ] installed").red().to_string(),
+            "a fact undone is worth seeing"
+        );
+        assert_eq!(
+            row(&form, "recommended"),
+            "  [ ] recommended",
+            "declining a recommendation is an ordinary answer, and unmarked"
+        );
+    }
+
+    /// While it stands, a suggestion is blue — distinct from the plain tick of something already
+    /// installed, which is the distinction the colour exists to draw.
+    #[test]
+    fn a_standing_suggestion_is_blue_and_a_plain_tick_is_not() {
+        let form = suggested_form();
+        let rows = focusables(&form);
+        let lines = render(&form, &rows, rows.len() - 1, 80, &[], &Opened::of(&form));
+        let row = |want: &str| {
+            lines.iter().find(|line| console::strip_ansi_codes(line).contains(want)).expect("drawn")
+        };
+
+        assert_eq!(row("installed"), "  [x] installed", "already so — no colour");
+        assert_eq!(
+            row("recommended"),
+            &format!("  {}", console::style("[x] recommended").color256(SUGGESTED_BLUE)),
+            "recommended — blue"
+        );
+        assert_eq!(row("neither"), "  [ ] neither");
+    }
+
+    /// A suggestion is an answer like any other. Blue is about where the tick CAME FROM, not
+    /// about whether it counts.
+    #[test]
+    fn a_suggestion_counts_in_the_answers() {
+        let form = suggested_form();
+        assert_eq!(form.checked("packages"), ["installed", "recommended"]);
+        assert!(form.answers_toml().contains("recommended"), "{}", form.answers_toml());
+    }
+
+    /// Grids say it with `GridCell::suggest`, and behave identically — same exemption, same blue.
+    #[test]
+    fn a_grid_cell_can_be_suggested_too() {
+        let row = |label: &str, cell: GridCell| GridRow {
+            label: label.into(),
+            heading: None,
+            note: None,
+            cells: vec![cell],
+            tags: Vec::new(),
+        };
+        let mut form = Form::new().grid(
+            "packages",
+            &["apt"],
+            vec![row("installed", GridCell::set(None)), row("recommended", GridCell::open(None).suggest())],
+        );
+        let opened = Opened::of(&form);
+        let rows = focusables(&form);
+        // By content rather than by index: a grid draws a label line and a header above its rows,
+        // and counting past them is how the first version of this test went wrong.
+        let row_of = |form: &Form, want: &str| {
+            render(form, &rows, rows.len() - 1, 80, &[], &opened)
+                .into_iter()
+                .find(|line| console::strip_ansi_codes(line).contains(want))
+                .expect("drawn")
+        };
+        let boxed = |mark: &str| format!("{}  {mark}", console::style("[x]").color256(SUGGESTED_BLUE));
+
+        assert_eq!(row_of(&form, "recommended"), boxed("recommended"), "suggested — blue");
+        assert_eq!(row_of(&form, "installed"), "[x]  installed", "already so — plain");
+
+        // Clear both. Only the one the form ASSERTED reddens.
+        let Item::Grid { rows: grid, .. } = &mut form.items[0] else { panic!() };
+        grid[0].cells[0].checked = false;
+        grid[1].cells[0].checked = false;
+        assert_eq!(
+            row_of(&form, "installed"),
+            format!("{}  installed", console::style("[ ]").red()),
+            "a fact undone"
+        );
+        assert_eq!(row_of(&form, "recommended"), "[ ]  recommended", "a suggestion declined");
+    }
+
+    /// Re-ticking a suggestion restores the blue: the box is standing again, and where it came
+    /// from has not changed. It never becomes red, in either direction.
+    #[test]
+    fn a_suggestion_toggled_off_and_on_is_blue_again_and_never_red() {
+        let mut form = suggested_form();
+        let opened = Opened::of(&form);
+        let rows = focusables(&form);
+        let mut focus = rows.iter().position(|r| *r == Focus::Option { item: 0, option: 1 }).unwrap();
+        let line = |form: &Form| {
+            render(form, &rows, rows.len() - 1, 80, &[], &opened)
+                .into_iter()
+                .find(|l| console::strip_ansi_codes(l).contains("recommended"))
+                .expect("drawn")
+        };
+
+        apply(&mut form, &rows, &mut focus, Key::Char(' '));
+        assert_eq!(line(&form), "  [ ] recommended", "off, and not red");
+        apply(&mut form, &rows, &mut focus, Key::Char(' '));
+        assert_eq!(
+            line(&form),
+            format!("  {}", console::style("[x] recommended").color256(SUGGESTED_BLUE)),
+            "on again, and blue again"
+        );
+    }
+
+    // ——— filtering by tag ————————————————————————————————————————————————
+
+    /// Three rows across two sections, tagged so that every case has an example: one plain,
+    /// one carrying two tags, one carrying none at all.
+    fn tagged() -> Form {
+        let row = |label: &str, heading: Option<&str>, tags: &[&str]| GridRow {
+            label: label.into(),
+            heading: heading.map(Into::into),
+            note: None,
+            cells: vec![GridCell::open(None)],
+            tags: tags.iter().map(|tag| (*tag).to_string()).collect(),
+        };
+        Form::new()
+            .grid(
+                "packages",
+                &["apt"],
+                vec![
+                    row("ripgrep", Some("# tools"), &["terminal"]),
+                    // Its own section, so filtering it away empties one. Without a heading it
+                    // would fall into `# apps` below and keep that section alive — which is
+                    // correct, and caught this fixture out when it was written the other way.
+                    row("zoom", Some("# apps"), &["gui", "spyware"]),
+                    row("mystery", Some("# unknown"), &[]),
+                ],
+            )
+            .filters(
+                "Include",
+                &[("terminal", "terminal-only"), ("gui", "GUI-only"), ("spyware", "spyware")],
+            )
+    }
+
+    /// The block itself: one row per offered tag, all ticked, above everything it governs — and
+    /// it is not an item, so it never reaches the answers.
+    #[test]
+    fn the_filter_block_draws_above_the_form_and_is_not_an_answer() {
+        let form = tagged();
+        let lines = drawn(&form);
+        assert_eq!(
+            lines.iter().map(|l| l.trim()).take(5).collect::<Vec<_>>(),
+            ["Include:", "[x] terminal-only", "[x] GUI-only", "[x] spyware", ""],
+            "{lines:#?}"
+        );
+        assert!(!form.answers_toml().contains("Include"), "{}", form.answers_toml());
+        assert!(!form.answers_toml().contains("terminal-only"), "a filter is not a question");
+    }
+
+    /// The filter block is violet, and nothing else is — it is the one block on screen that is
+    /// not part of the answers, so it does not look like the things that are. Focus still
+    /// reverses it, which means the colour has to survive being re-armed through the reverse
+    /// video rather than ending it halfway along the row.
+    #[test]
+    fn the_filter_block_is_coloured_and_stays_coloured_under_the_cursor() {
+        // Expectations built through `console::style` like every other colour test here, because
+        // `style` emits nothing when stdout is not a terminal — which under `cargo test` it never
+        // is. Comparing styled against styled holds either way, and checks the real thing when a
+        // run does have colour.
+        let violet = |text: &str| console::style(text).color256(FILTER_VIOLET).to_string();
+        let form = tagged();
+        let rows = focusables(&form);
+        let lines = render(&form, &rows, rows.len() - 1, 200, &[], &Opened::of(&form));
+
+        assert_eq!(lines[0], violet("Include:"), "the heading");
+        assert_eq!(lines[1], format!("  {}", violet("[x] terminal-only")), "and each box");
+        // The rows the filter GOVERNS keep the plain form every other entry has. Asserted as
+        // equality rather than "is not violet": with colour off, `violet("")` is the empty
+        // string and `contains` of it is true of everything — a check that could never fail.
+        let ripgrep = lines.iter().find(|l| l.contains("ripgrep")).expect("drawn");
+        assert_eq!(ripgrep, "[ ]  ripgrep", "an entry is styled by nothing here");
+
+        // Focused, the colour is re-armed after its own reset so the reverse video runs the whole
+        // row instead of stopping where the violet ends.
+        let at = rows.iter().position(|row| *row == Focus::Filter { at: 0 }).unwrap();
+        let focused = &render(&form, &rows, at, 200, &[], &Opened::of(&form))[1];
+        let styled = violet("[x] terminal-only");
+        assert_eq!(
+            *focused,
+            format!("\x1b[7m▸ {}\x1b[0m", styled.replace("\x1b[0m", "\x1b[0m\x1b[7m"))
+        );
+    }
+
+    /// The semantics, and the whole reason the choice mattered: an entry is hidden when it
+    /// carries ANY cleared tag. Clearing `spyware` removes the spyware even though it is also
+    /// tagged `gui` and `gui` is still ticked. A filter that leaked here would be useless for
+    /// the thing filters are mostly wanted for.
+    #[test]
+    fn any_cleared_tag_hides_an_entry_even_when_another_of_its_tags_stays() {
+        let mut form = tagged();
+        assert!(!form.filtered_out(0, 1), "everything shows to begin with");
+
+        form.excluded.insert("spyware".into());
+        assert!(form.filtered_out(0, 1), "zoom carries spyware, so zoom goes");
+        assert!(!form.filtered_out(0, 0), "ripgrep carries neither");
+        assert!(!form.filtered_out(0, 2), "and an untagged row can never be excluded");
+
+        let lines = drawn(&form);
+        assert!(!lines.iter().any(|line| line.contains("zoom")), "{lines:#?}");
+        assert!(lines.iter().any(|line| line.contains("ripgrep")), "{lines:#?}");
+        assert!(lines.iter().any(|line| line.contains("mystery")), "{lines:#?}");
+    }
+
+    /// Hiding a row is not answering for it: a filtered entry keeps every tick it had, and comes
+    /// back with them when the tag is restored.
+    #[test]
+    fn filtering_never_touches_the_answers() {
+        let mut form = tagged();
+        let Item::Grid { rows, .. } = &mut form.items[0] else { panic!() };
+        rows[1].cells[0].checked = true; // zoom, ticked
+        let before = form.answers_toml();
+        assert!(before.contains("zoom"), "{before}");
+
+        form.excluded.insert("spyware".into());
+        assert!(form.filtered_out(0, 1), "out of sight");
+        assert_eq!(form.answers_toml(), before, "…and still in the answers");
+
+        form.excluded.remove("spyware");
+        assert!(!form.filtered_out(0, 1), "and back again, unchanged");
+        assert_eq!(form.answers_toml(), before);
+    }
+
+    /// A filtered row is unreachable, by the same rule as a folded or disabled one.
+    #[test]
+    fn the_cursor_skips_filtered_rows() {
+        let mut form = tagged();
+        form.excluded.insert("spyware".into());
+        let rows = focusables(&form);
+        assert!(!rows.iter().any(|row| matches!(row, Focus::Cell { row: 1, .. })), "{rows:#?}");
+        assert!(rows.iter().any(|row| matches!(row, Focus::Cell { row: 0, .. })));
+        assert_eq!(rows[0], Focus::Filter { at: 0 }, "the filter leads the list");
+    }
+
+    /// Space toggles a filter box, and the cursor stays on it even though the rows below have
+    /// just appeared or vanished under it.
+    #[test]
+    fn space_toggles_a_filter_and_the_cursor_holds_its_place() {
+        let mut form = tagged();
+        let rows = focusables(&form);
+        let mut focus = rows.iter().position(|r| *r == Focus::Filter { at: 2 }).unwrap();
+
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Char(' ')), Action::Redraw);
+        assert!(form.excluded.contains("spyware"), "cleared");
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Filter { at: 2 }, "still on the box just pressed");
+
+        apply(&mut form, &rows, &mut focus, Key::Char(' '));
+        assert!(!form.excluded.contains("spyware"), "and back");
+    }
+
+    /// A section the filter empties disappears entirely — heading, markers and all. A `v` over
+    /// nothing is a control that folds nothing.
+    #[test]
+    fn a_section_emptied_by_the_filter_is_not_drawn_at_all() {
+        let mut form = tagged().collapsible();
+        assert!(drawn(&form).iter().any(|line| line.trim() == "v # apps"));
+
+        form.excluded.insert("spyware".into()); // "# apps" holds only zoom
+        let lines = drawn(&form);
+        assert!(!lines.iter().any(|line| line.contains("# apps")), "{lines:#?}");
+        assert!(lines.iter().any(|line| line.contains("# tools")), "the other one stays");
+        assert!(form.section_emptied(0, 1));
+        assert!(!form.section_emptied(0, 0));
+        let rows = focusables(&form);
+        assert!(
+            !rows.iter().any(|row| matches!(row, Focus::Section { slot: 1, .. })),
+            "and its fold rows go with it: {rows:#?}"
+        );
+    }
+
+    /// Filtering works whether or not the form folds — they are independent flags, and `hidden`
+    /// is one predicate over both so nothing downstream has to check for each.
+    #[test]
+    fn filtering_and_folding_are_independent() {
+        let mut plain = tagged();
+        let mut folding = tagged().collapsible();
+        plain.excluded.insert("terminal".into());
+        folding.excluded.insert("terminal".into());
+        assert!(!drawn(&plain).iter().any(|line| line.contains("ripgrep")), "filter alone");
+        assert!(!drawn(&folding).iter().any(|line| line.contains("ripgrep")), "and with folding");
+
+        // Folded AND filtered: still hidden, and unfolding does not bring back a filtered row.
+        let form = tagged().collapsible().folded(0, 1);
+        assert!(form.hidden(0, 1), "folded");
+        let mut form = form;
+        form.excluded.insert("spyware".into());
+        form.collapsed.clear();
+        assert!(form.hidden(0, 1), "unfolded, but still filtered out");
+    }
+
+    // ——— repainting ——————————————————————————————————————————————————————
+
+    /// Net vertical movement of a frame: down for every newline, up for every `\x1b[nA`.
+    fn drift(frame: &str) -> isize {
+        let downs = frame.matches('\n').count() as isize;
+        let ups: isize = frame
+            .split("\x1b[")
+            .filter_map(|part| part.split_once('A'))
+            .filter(|(digits, _)| !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit()))
+            .filter_map(|(digits, _)| digits.parse::<isize>().ok())
+            .sum();
+        downs - ups
+    }
+
+    /// The whole repaint is ONE string, and it never blanks anything before drawing it. Those two
+    /// together are what stopped the flicker: `Term::stderr()` is unbuffered, so the old
+    /// clear-then-print cost `3n + 2` separate writes — 122 of them for a 40-line form — and a
+    /// terminal renders as they arrive.
+    #[test]
+    fn a_repaint_is_one_write_that_overwrites_rather_than_clearing() {
+        let frame = _frame(&["one".into(), "two".into()], 2);
+        assert_eq!(frame, "\x1b[2Aone\x1b[K\ntwo\x1b[K\n");
+        assert!(!frame.contains("\x1b[2K"), "nothing is blanked whole: {frame:?}");
+        assert!(!frame.contains("\x1b[2J"), "and the screen is never cleared: {frame:?}");
+    }
+
+    /// The first paint has nothing above it to step back over.
+    #[test]
+    fn the_first_frame_does_not_move_the_cursor_up() {
+        let frame = _frame(&["only".into()], 0);
+        assert_eq!(frame, "only\x1b[K\n");
+        assert_eq!(drift(&frame), 1, "one line drawn, cursor one below where it began");
+    }
+
+    /// A frame that shrank must wipe what it no longer covers — folding a section is exactly
+    /// this, and without it the tail of the old form stays on screen under the new one.
+    #[test]
+    fn a_shorter_frame_erases_the_rows_it_gave_up() {
+        let frame = _frame(&["kept".into()], 4);
+        assert_eq!(frame, "\x1b[4Akept\x1b[K\n\x1b[K\n\x1b[K\n\x1b[K\n\x1b[3A");
+        assert_eq!(drift(&frame), -3, "four rows became one: three higher than before");
+    }
+
+    /// Growing needs no wiping: the new rows land on ground the old frame never held.
+    #[test]
+    fn a_longer_frame_just_writes_the_extra_rows() {
+        let frame = _frame(&["a".into(), "b".into(), "c".into()], 1);
+        assert_eq!(frame, "\x1b[1Aa\x1b[K\nb\x1b[K\nc\x1b[K\n");
+        assert_eq!(drift(&frame), 2);
+    }
+
+    /// The invariant every repaint depends on: afterwards the cursor sits immediately below the
+    /// frame just drawn, so the next call finds the block by stepping up its own height. Checked
+    /// across every shape, because getting it wrong by one drifts the form down the screen a row
+    /// per keystroke — which is the other way a form flickers.
+    #[test]
+    fn the_cursor_always_lands_just_under_the_new_frame() {
+        for previous in 0..6 {
+            for height in 0..6 {
+                let lines: Vec<String> = (0..height).map(|n| format!("line {n}")).collect();
+                let frame = _frame(&lines, previous);
+                assert_eq!(
+                    drift(&frame),
+                    height as isize - previous as isize,
+                    "{height} lines over {previous}: {frame:?}"
+                );
+            }
+        }
+    }
+
+    /// Teardown is the empty frame: everything erased, cursor back where the form began. It
+    /// replaces `clear_last_lines`, and doing BOTH would erase that many rows again — above the
+    /// form, taking whatever the caller had printed before it.
+    #[test]
+    fn an_empty_frame_removes_the_form_and_rewinds() {
+        let frame = _frame(&[], 3);
+        assert_eq!(frame, "\x1b[3A\x1b[K\n\x1b[K\n\x1b[K\n\x1b[3A");
+        assert_eq!(drift(&frame), -3, "back to where the form started");
+        assert!(!frame.contains("line"), "and nothing drawn");
+    }
+
+    /// Holding an arrow key used to queue one full repaint per keystroke, and a big grid takes
+    /// long enough to draw that the backlog showed as the form freezing for seconds. Keys are
+    /// now folded into one frame while more are already waiting.
+    ///
+    /// The rule that must never bend is the last two assertions: ending the run is never
+    /// deferred for a tidier moment.
+    #[test]
+    fn keystrokes_are_folded_into_one_frame_but_never_the_last_one() {
+        assert!(_coalesce(&Action::Redraw, true, 0), "more waiting — no need to paint yet");
+        assert!(!_coalesce(&Action::Redraw, false, 0), "nothing waiting — paint now");
+        assert!(
+            !_coalesce(&Action::Redraw, true, COALESCE),
+            "a flood cannot hold the screen still for ever"
+        );
+        assert!(!_coalesce(&Action::Submit, true, 0), "submitting ends the run, queue or no queue");
+        assert!(!_coalesce(&Action::Cancel, true, 0), "and so does cancelling");
+    }
+
+    /// Ctrl+A means every box, including the ones currently folded away. The alternative — "all
+    /// the boxes you can see" — would make the answer depend on which sections happen to be open,
+    /// which is a worse surprise than a hidden box changing.
+    #[test]
+    fn tick_all_reaches_into_folded_sections() {
+        let mut form = sectioned().collapsible().folded(0, 0);
+        let rows = focusables(&form);
+        let mut focus = 0;
+        apply(&mut form, &rows, &mut focus, Key::Home);
+        assert_eq!(form.checked("packages"), ["git", "jq", "brave", "firefox"], "all four");
+    }
+
     fn grid_form() -> Form {
         let cell = |on: bool, live: bool| match (on, live) {
             (_, false) => GridCell::blank(),
@@ -1032,18 +2174,21 @@ mod tests {
                     heading: Some("# tools".into()),
                     note: Some("version control".into()),
                     cells: vec![cell(true, true), GridCell::blank(), GridCell::blank()],
+                    tags: Vec::new(),
                 },
                 GridRow {
                     label: "brave".into(),
                     heading: Some("# browsers".into()),
                     note: None,
                     cells: vec![GridCell::blank(), cell(true, true), cell(false, true)],
+                    tags: Vec::new(),
                 },
                 GridRow {
                     label: "firefox".into(),
                     heading: None,
                     note: None,
                     cells: vec![cell(false, true), cell(false, true), cell(false, true)],
+                    tags: Vec::new(),
                 },
             ],
         )
@@ -1111,6 +2256,43 @@ mod tests {
         // reaches Submit at all.
         apply(&mut form, &rows, &mut focus, Key::ArrowDown);
         assert_eq!(at(focus), Focus::Submit);
+    }
+
+    /// Neither a gap nor a locked box has a focus row, so no key can reach either — the same
+    /// guarantee a disabled option has, by the same mechanism. They are drawn differently (a box
+    /// says the choice exists, a gap says it does not) and reached identically: not at all.
+    #[test]
+    fn a_locked_box_and_a_gap_are_both_unreachable() {
+        let mut form = Form::new().grid(
+            "",
+            &["apt", "snap", "flatpak"],
+            vec![GridRow {
+                label: "neovim".into(),
+                heading: None,
+                note: None,
+                cells: vec![
+                    GridCell::open(Some("install".into())),
+                    GridCell::locked(false),
+                    GridCell::blank(),
+                ],
+                tags: Vec::new(),
+            }],
+        );
+        let rows = focusables(&form);
+        assert_eq!(
+            rows,
+            [Focus::Cell { item: 0, row: 0, column: 0 }, Focus::Submit],
+            "only the live cell, so sideways has nowhere to wander: {rows:?}"
+        );
+
+        let mut focus = 0;
+        for _ in 0..12 {
+            apply(&mut form, &rows, &mut focus, Key::Char(' '));
+            apply(&mut form, &rows, &mut focus, Key::ArrowRight);
+        }
+        let Item::Grid { rows: grid, .. } = &form.items[0] else { panic!() };
+        assert!(!grid[0].cells[1].checked, "a locked box stayed put through every keystroke");
+        assert!(!grid[0].cells[2].checked, "and so did the gap");
     }
 
     /// A cell nothing offers has no focus row, so no key can reach it — the same guarantee a
@@ -1355,8 +2537,8 @@ mod tests {
         apply(&mut form, &rows, &mut focus, Key::Home);
         assert!(form.checked("Tops").is_empty(), "all-on toggles to all-off");
         // Partially ticked → Ctrl+A completes the set rather than clearing it.
-        let Item::Checkboxes { checked, .. } = &mut form.items[1] else { panic!() };
-        checked[0] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[1] else { panic!() };
+        options[0].checked = true;
         apply(&mut form, &rows, &mut focus, Key::Home);
         assert_eq!(form.checked("Tops"), ["a", "b"], "partial → filled, not cleared");
 
@@ -1486,8 +2668,8 @@ mod tests {
     #[test]
     fn the_render_shows_state_and_marks_exactly_one_focused_row() {
         let mut form = form().title("T");
-        let Item::Checkboxes { checked, .. } = &mut form.items[1] else { panic!() };
-        checked[1] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[1] else { panic!() };
+        options[1].checked = true;
         let Item::Radio { chosen, .. } = &mut form.items[2] else { panic!() };
         *chosen = Some(0);
         let rows = focusables(&form);

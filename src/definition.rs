@@ -3,7 +3,7 @@
 //! whichever door was used.
 
 use crate::comments::{self, Comments};
-use crate::{Condition, Form, Item, Warning};
+use crate::{Choice, Condition, Form, Item, Warning};
 
 /// How a definition's `check_if` / `enabled_if` predicates get answered — or `None` when nobody
 /// offered to answer them. The strings are opaque here: what "path:zed" means is the caller's
@@ -18,6 +18,25 @@ struct Choices {
     enabled: Vec<bool>,
     /// What each option's `check_if` resolved to.
     checked: Vec<bool>,
+}
+
+impl Choices {
+    /// Zip the parallel arrays a definition is naturally read into, out into the per-option
+    /// struct the form holds. Parsing produces columns; `Item` wants rows.
+    fn rows(&self) -> Vec<Choice> {
+        self.options
+            .iter()
+            .enumerate()
+            .map(|(at, name)| Choice {
+                name: name.clone(),
+                checked: self.checked.get(at).copied().unwrap_or(false),
+                heading: self.headings.get(at).cloned().flatten(),
+                enabled: self.enabled.get(at).copied().unwrap_or(true),
+                tags: Vec::new(),
+                suggested: false,
+            })
+            .collect()
+    }
 }
 
 /// TOML → [`Form`]. The schema is documented on [`Form::from_toml`]; errors name the item they
@@ -74,7 +93,8 @@ pub(crate) fn from_toml(text: &str, resolve: Resolver) -> Result<Form, String> {
                         .ok_or_else(|| at(&format!("`checked` names {name:?}, not an option")))?;
                     checked[slot] = true;
                 }
-                form.items.push(Item::Checkboxes { label, options, checked, headings, enabled });
+                let group = Choices { options, headings, enabled, checked };
+                form.items.push(Item::Checkboxes { label, options: group.rows() });
             }
             "radio" => {
                 let label = field("label")?.to_string();
@@ -92,7 +112,8 @@ pub(crate) fn from_toml(text: &str, resolve: Resolver) -> Result<Form, String> {
                         )?)
                     }
                 };
-                form.items.push(Item::Radio { label, options, chosen, headings, enabled });
+                let group = Choices { options, headings, enabled, checked };
+                form.items.push(Item::Radio { label, chosen, options: group.rows() });
             }
             "text" => form.items.push(Item::Text {
                 label: field("label")?.to_string(),
@@ -198,7 +219,7 @@ fn _condition(value: &toml::Value, at: &dyn Fn(&str) -> String) -> Result<Condit
 /// rather than wrong — the worst way for a caution to fail. Refused here, where the typo is, the
 /// same way a stale `checked = […]` pre-selection is.
 fn _reject_unknown_targets(form: &Form, condition: &Condition) -> Result<(), String> {
-    let group = |label: &str, radio: bool| -> Result<&Vec<String>, String> {
+    let group = |label: &str, radio: bool| -> Result<&Vec<Choice>, String> {
         form.items
             .iter()
             .find_map(|item| match item {
@@ -213,8 +234,8 @@ fn _reject_unknown_targets(form: &Form, condition: &Condition) -> Result<(), Str
                 format!("no {kind} group is labelled {label:?}")
             })
     };
-    let known = |options: &[String], wanted: &[String]| -> Result<(), String> {
-        match wanted.iter().find(|want| !options.contains(want)) {
+    let known = |options: &[Choice], wanted: &[String]| -> Result<(), String> {
+        match wanted.iter().find(|want| !options.iter().any(|o| o.name == **want)) {
             Some(stray) => Err(format!("{stray:?} is not one of that group's options")),
             None => Ok(()),
         }
@@ -323,7 +344,8 @@ pub(crate) fn from_args(args: impl Iterator<Item = String>) -> Result<Form, Stri
                     checked[slot] = true;
                 }
                 let (headings, enabled) = _plain(options.len());
-                form.items.push(Item::Checkboxes { label, options, checked, headings, enabled });
+                let group = Choices { options, headings, enabled, checked };
+                form.items.push(Item::Checkboxes { label, options: group.rows() });
             }
             "--radio" => {
                 let (label, options, picked) = _choice_spec(&value("--radio")?)?;
@@ -335,7 +357,10 @@ pub(crate) fn from_args(args: impl Iterator<Item = String>) -> Result<Form, Stri
                     _ => return Err(format!("--radio {label:?}: only one option can be chosen")),
                 };
                 let (headings, enabled) = _plain(options.len());
-                form.items.push(Item::Radio { label, options, chosen, headings, enabled });
+                // A radio's pre-selection is `chosen`; no per-option ticks come through a flag.
+                let checked = vec![false; options.len()];
+                let group = Choices { options, headings, enabled, checked };
+                form.items.push(Item::Radio { label, chosen, options: group.rows() });
             }
             "--text" => {
                 let spec = value("--text")?;
@@ -482,8 +507,8 @@ mod tests {
         assert_eq!(form.active_warnings(), ["fish without an editor."]);
 
         let mut louder = form.clone();
-        let Item::Checkboxes { checked, .. } = &mut louder.items[0] else { panic!() };
-        checked[1] = true;
+        let Item::Checkboxes { options, .. } = &mut louder.items[0] else { panic!() };
+        options[1].checked = true;
         assert_eq!(louder.active_warnings().len(), 2, "both hold once a second VPN is on");
     }
 
@@ -546,11 +571,12 @@ mod tests {
         .expect("loads");
 
         assert_eq!(form.items[0], Item::Comment("about the packages".into()), "{:?}", form.items[0]);
-        let Item::Checkboxes { headings, options, .. } = &form.items[1] else { panic!() };
-        assert_eq!(options, &["zed", "helix", "firefox"], "still one group, three options");
-        assert_eq!(headings[0].as_deref(), Some("dev-tools"));
-        assert_eq!(headings[1], None, "a sub-title covers the option under it, not the run");
-        assert_eq!(headings[2].as_deref(), Some("web browsers"));
+        let Item::Checkboxes { options, .. } = &form.items[1] else { panic!() };
+        let names: Vec<&str> = options.iter().map(|o| o.name.as_str()).collect();
+        assert_eq!(names, ["zed", "helix", "firefox"], "still one group, three options");
+        assert_eq!(options[0].heading.as_deref(), Some("dev-tools"));
+        assert_eq!(options[1].heading, None, "a sub-title covers the option under it, not the run");
+        assert_eq!(options[2].heading.as_deref(), Some("web browsers"));
         // The sections did NOT become separate groups: one label still answers for all three.
         assert_eq!(form.items.len(), 2, "a comment item and a group: {:?}", form.items);
     }
@@ -574,16 +600,18 @@ mod tests {
         let answer = |spec: &str| spec.starts_with("yes:");
 
         let asked = Form::from_toml_with(text, answer).expect("loads");
-        let Item::Checkboxes { checked, enabled, .. } = &asked.items[0] else { panic!() };
-        assert_eq!(checked, &[false, true, false, false, false], "only the true check_if ticks");
-        assert_eq!(enabled, &[true, true, true, false, true], "only the false enabled_if locks");
+        let Item::Checkboxes { options, .. } = &asked.items[0] else { panic!() };
+        let ticks: Vec<bool> = options.iter().map(|o| o.checked).collect();
+        let live: Vec<bool> = options.iter().map(|o| o.enabled).collect();
+        assert_eq!(ticks, [false, true, false, false, false], "only the true check_if ticks");
+        assert_eq!(live, [true, true, true, false, true], "only the false enabled_if locks");
 
         // Nobody answering: nothing pre-ticked, everything still usable. The asymmetry is the
         // point — defaulting `enabled_if` the other way would hand back a frozen form.
         let unasked = Form::from_toml(text).expect("loads");
-        let Item::Checkboxes { checked, enabled, .. } = &unasked.items[0] else { panic!() };
-        assert!(checked.iter().all(|on| !on), "no answer, no tick");
-        assert!(enabled.iter().all(|on| *on), "no answer, nothing frozen");
+        let Item::Checkboxes { options, .. } = &unasked.items[0] else { panic!() };
+        assert!(options.iter().all(|o| !o.checked), "no answer, no tick");
+        assert!(options.iter().all(|o| o.enabled), "no answer, nothing frozen");
     }
 
     /// A `check_if` on a radio picks its option, and the `checked = […]` list still layers on top
@@ -663,8 +691,8 @@ mod tests {
             .checkboxes("", &["two"])
             .text("Name", "Ada");
         assert_eq!(form.items.len(), 4, "two anonymous groups coexist");
-        if let crate::Item::Checkboxes { checked, .. } = &mut form.items[0] {
-            checked[0] = true;
+        if let crate::Item::Checkboxes { options, .. } = &mut form.items[0] {
+            options[0].checked = true;
         }
         let answers = form.answers_toml();
         assert!(answers.contains("Name"), "{answers}");

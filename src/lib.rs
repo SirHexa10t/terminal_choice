@@ -43,31 +43,14 @@ pub use ui::{run, run_with_warnings, Outcome};
 pub enum Item {
     /// Display-only text: rendered dim, never focusable, never in the answers.
     Comment(String),
-    /// Choose any number of `options`; `checked`, `headings` and `enabled` all run parallel
-    /// to them (see [`Item::Radio`] for what the last two mean — they are the same here).
-    Checkboxes {
-        label: String,
-        options: Vec<String>,
-        checked: Vec<bool>,
-        headings: Vec<Option<String>>,
-        enabled: Vec<bool>,
-    },
+    /// Choose any number of `options`. Each carries its own state — see [`Choice`].
+    Checkboxes { label: String, options: Vec<Choice> },
     /// Choose exactly one of `options` (or none, if the user never picks).
     ///
-    /// `headings[i]`, when present, is a sub-title drawn above option `i` — what a long list
-    /// needs to read as sections ("dev-tools", "web browsers") without becoming several groups
-    /// and several answers. Multi-line headings draw on several lines.
-    ///
-    /// `enabled[i]` is whether option `i` is the user's to change. A disabled option is drawn
-    /// dim and the cursor never lands on it, so no key can reach it — but it keeps whatever
-    /// state it was given and still counts in the answers: "already true, not yours to change".
-    Radio {
-        label: String,
-        options: Vec<String>,
-        chosen: Option<usize>,
-        headings: Vec<Option<String>>,
-        enabled: Vec<bool>,
-    },
+    /// The selection is `chosen` rather than a flag on each option, because "exactly one" is a
+    /// fact about the GROUP and per-option flags could contradict it. [`Choice::checked`] is
+    /// therefore ignored here.
+    Radio { label: String, chosen: Option<usize>, options: Vec<Choice> },
     /// Free text, editable in place.
     Text { label: String, value: String },
     /// A table of checkboxes: one row per thing, one column per way of having it.
@@ -85,6 +68,98 @@ pub enum Item {
     },
 }
 
+/// One option of a choice group — [`Item::Checkboxes`] or [`Item::Radio`].
+///
+/// Replaces what were six arrays running alongside each other: `options`, `checked`, `headings`,
+/// `enabled`, `tags`, `suggested`. Every one had to stay exactly as long as the rest, and nothing
+/// enforced it — a group built with five states for six options was a panic waiting for the right
+/// keystroke. One struct per option makes that class of mistake unrepresentable.
+///
+/// Built fluently, like `software_inventory`'s `Package`, because most options say only their
+/// name and the rest is exception:
+///
+/// ```
+/// # use terminal_choice::Choice;
+/// let plain = Choice::named("zed");
+/// let more = Choice::named("mullvad").ticked().heading("# vpn").tags(&["network"]);
+/// assert!(!plain.checked && plain.enabled);
+/// assert!(more.checked && more.heading.as_deref() == Some("# vpn"));
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Choice {
+    /// What it is called, and what the answers give back.
+    pub name: String,
+    /// Ticked, for a checkbox group. A radio's selection lives in [`Item::Radio::chosen`] —
+    /// exactly one option is picked, which a per-option flag could contradict.
+    pub checked: bool,
+    /// A sub-title drawn above this option — what a long list needs to read as sections without
+    /// becoming several groups and several answers. Multi-line headings draw on several lines.
+    pub heading: Option<String>,
+    /// Whether this option is the user's to change. A disabled one is drawn dim and the cursor
+    /// never lands on it, but it keeps its state and still counts: "already true, not yours".
+    pub enabled: bool,
+    /// What it IS, for filtering — see [`Form::filters`].
+    pub tags: Vec<String>,
+    /// Whether `checked` is owed to a suggestion rather than a fact — see [`Choice::suggest`].
+    pub suggested: bool,
+}
+
+impl Choice {
+    /// An option that is clear, live, unheaded and untagged — which most of them are.
+    #[must_use]
+    pub fn named(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            checked: false,
+            heading: None,
+            enabled: true,
+            tags: Vec::new(),
+            suggested: false,
+        }
+    }
+
+    /// Arrives ticked, as a FACT about the machine. Clearing it is a deviation, and marked red.
+    #[must_use]
+    pub fn ticked(mut self) -> Self {
+        self.checked = true;
+        self
+    }
+
+    /// A sub-title above this option.
+    #[must_use]
+    pub fn heading(mut self, heading: impl Into<String>) -> Self {
+        self.heading = Some(heading.into());
+        self
+    }
+
+    /// Shown and counted, but not the user's to change.
+    #[must_use]
+    pub fn locked(mut self) -> Self {
+        self.enabled = false;
+        self
+    }
+
+    /// What this option is, for [`Form::filters`].
+    #[must_use]
+    pub fn tags(mut self, tags: &[&str]) -> Self {
+        self.tags = tags.iter().map(|tag| (*tag).to_string()).collect();
+        self
+    }
+
+    /// Recommend it: tick it, and draw it blue to say the form put the tick there.
+    ///
+    /// An option that is ALREADY ticked comes back untouched — white, and still a fact. See
+    /// [`GridCell::suggest`], which says the same for a grid and explains why.
+    #[must_use]
+    pub fn suggest(mut self) -> Self {
+        if !self.checked {
+            self.checked = true;
+            self.suggested = true;
+        }
+        self
+    }
+}
+
 /// One row of an [`Item::Grid`]: a thing, and one cell per column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GridRow {
@@ -100,6 +175,12 @@ pub struct GridRow {
     /// Parallel to the grid's `columns`. A row with fewer cells than there are columns simply
     /// has nothing to say about the rest, which draws as blank.
     pub cells: Vec<GridCell>,
+    /// What this row IS, for filtering — see [`Form::filters`].
+    ///
+    /// Carried by the row rather than registered separately, because whoever builds a row
+    /// already knows: `os_ricing` writes `package.tags` here in the same expression that writes
+    /// the label. A second pass to attach them would be a second place to forget.
+    pub tags: Vec<String>,
 }
 
 /// One box of an [`Item::Grid`], and what it would do.
@@ -125,33 +206,61 @@ pub struct GridCell {
     pub on_set: Option<String>,
     /// What clearing this would do, shown while the cursor is on it and it is TICKED.
     pub on_clear: Option<String>,
+    /// This tick is a SUGGESTION, not a fact about the machine — see [`GridCell::suggest`].
+    pub suggested: bool,
 }
 
 impl GridCell {
     /// A cell the user may tick, doing `on_set`.
     #[must_use]
     pub fn open(on_set: Option<String>) -> Self {
-        Self { checked: false, enabled: true, boxed: true, on_set, on_clear: None }
+        Self { checked: false, enabled: true, boxed: true, on_set, on_clear: None, suggested: false }
     }
 
     /// A cell that arrives ticked, and would do `on_clear` if emptied.
     #[must_use]
     pub fn set(on_clear: Option<String>) -> Self {
-        Self { checked: true, enabled: true, boxed: true, on_set: None, on_clear }
+        Self { checked: true, enabled: true, boxed: true, on_set: None, on_clear, suggested: false }
     }
 
-    /// A box that is shown but not the user's to change — dim, and space does nothing on it.
+    /// Recommend this cell: tick it, and draw it blue to say the form put the tick there.
     ///
-    /// Still a BOX, and still somewhere the cursor can rest: a reader deciding what to go and
-    /// set up needs to see the choice that is out of reach, and `would` is what it would run
-    /// once it were not. That line under the cursor is the whole argument for installing
-    /// whatever this column needs.
+    /// Blue is exempt from the red mark. That exemption is the whole point: clearing a tick the
+    /// form arrived with reads as undoing a fact, and is worth flagging — but a suggestion
+    /// asserts nothing, so declining one is an ordinary answer, and marking it would tell the
+    /// user they had broken something by disagreeing.
+    ///
+    /// A cell that is ALREADY ticked comes back untouched — white, and still a fact. A thing
+    /// does not become a recommendation by being recommended: it would have been ticked
+    /// regardless, so colouring it blue would credit the form with something that was already
+    /// true, and clearing it is still a deviation.
+    ///
+    /// A suggestion counts in the answers exactly as any other tick. What it changes is what a
+    /// deviation is measured against, not what is being asked.
+    ///
+    /// ```
+    /// # use terminal_choice::GridCell;
+    /// assert!(GridCell::open(None).suggest().suggested, "an empty box takes the hint");
+    /// assert!(!GridCell::set(None).suggest().suggested, "a fact stays a fact");
+    /// ```
     #[must_use]
-    pub fn locked(checked: bool, would: Option<String>) -> Self {
-        match checked {
-            true => Self { checked, enabled: false, boxed: true, on_set: None, on_clear: would },
-            false => Self { checked, enabled: false, boxed: true, on_set: would, on_clear: None },
+    pub fn suggest(mut self) -> Self {
+        if !self.checked {
+            self.checked = true;
+            self.suggested = true;
         }
+        self
+    }
+
+    /// A box that is shown but not the user's to change — dark grey, and the cursor skips it.
+    ///
+    /// Still a BOX rather than a gap, because the two say different things: a box says this
+    /// choice exists and something would have to change for it to be takeable, a gap says there
+    /// is no choice here at all. It carries no preview lines: nothing can focus it, so nothing
+    /// would ever show them.
+    #[must_use]
+    pub fn locked(checked: bool) -> Self {
+        Self { checked, enabled: false, boxed: true, on_set: None, on_clear: None, suggested: false }
     }
 
     /// No box: this column can never serve this row. Draws as a gap.
@@ -247,6 +356,31 @@ pub struct Form {
     /// that show one thing under several headings — a process in both a "top CPU" and a "top
     /// memory" list — where diverging states would be a contradiction.
     pub mirror_duplicates: bool,
+    /// Make the sub-titles interactive: each becomes a row the cursor can rest on, and folds the
+    /// options beneath it out of sight.
+    ///
+    /// Off by default, and deliberately a whole-form choice rather than a per-heading one. A
+    /// heading is a heading; whether a form is the KIND that folds is a fact about the form —
+    /// four sections of three want reading at a glance, four hundred packages want folding — and
+    /// a form with no headings is unaffected either way, since there is nothing to fold.
+    pub collapsible: bool,
+    /// Which sections are folded shut, as `(item, slot)` — the item they belong to, and the slot
+    /// their heading stands above.
+    ///
+    /// Display state, not an answer. A folded section's boxes keep every tick they had and still
+    /// appear in [`Form::answers_toml`]: folding hides a question, it does not withdraw it.
+    ///
+    /// Addressed by position rather than by heading text because two sections may legitimately be
+    /// called the same thing. Meaningless while `collapsible` is false, and ignored then.
+    pub collapsed: std::collections::BTreeSet<(usize, usize)>,
+    /// Tags the user may filter on, in display order, as `(tag, wording)` — see
+    /// [`Form::filters`]. Empty means no filter block, which is every form that never asks.
+    pub filters: Vec<(String, String)>,
+    /// The heading above that block.
+    pub filter_label: String,
+    /// Which of those tags are currently CLEARED. Display state, like `collapsed`: an entry
+    /// filtered out of sight keeps every answer it had.
+    pub excluded: std::collections::BTreeSet<String>,
 }
 
 impl Form {
@@ -275,10 +409,7 @@ impl Form {
     pub fn checkboxes(mut self, label: impl Into<String>, options: &[&str]) -> Self {
         self.items.push(Item::Checkboxes {
             label: label.into(),
-            checked: vec![false; options.len()],
-            headings: vec![None; options.len()],
-            enabled: vec![true; options.len()],
-            options: options.iter().map(|s| s.to_string()).collect(),
+            options: options.iter().map(|name| Choice::named(*name)).collect(),
         });
         self
     }
@@ -288,9 +419,7 @@ impl Form {
         self.items.push(Item::Radio {
             label: label.into(),
             chosen: None,
-            headings: vec![None; options.len()],
-            enabled: vec![true; options.len()],
-            options: options.iter().map(|s| s.to_string()).collect(),
+            options: options.iter().map(|name| Choice::named(*name)).collect(),
         });
         self
     }
@@ -328,6 +457,150 @@ impl Form {
     pub fn mirror_duplicates(mut self) -> Self {
         self.mirror_duplicates = true;
         self
+    }
+
+    /// Offer a block of tick-boxes, one per tag, that hides entries carrying the tags it clears.
+    ///
+    /// `label` heads the block; each `(tag, wording)` pairs the tag as entries carry it with the
+    /// words to show. Every one starts ticked, so a form opens showing everything.
+    ///
+    /// The list is the CALLER's: it decides which tags are worth filtering on. Entries carry
+    /// their own tags already ([`GridRow::tags`]), so nothing has to be registered here twice.
+    ///
+    /// ## What clearing one does
+    ///
+    /// An entry is hidden when it carries ANY cleared tag — not shown when it matches any that
+    /// remain. The difference only shows on an entry with two tags, and it is the difference
+    /// between a filter that works and one that leaks: clearing `spyware` has to remove the
+    /// spyware, including whatever is also tagged `gui`.
+    ///
+    /// An entry with no tags is never hidden, having nothing to be excluded by.
+    ///
+    /// ```
+    /// # use terminal_choice::{Form, GridCell, GridRow};
+    /// let row = |label: &str, tags: &[&str]| GridRow {
+    ///     label: label.into(),
+    ///     heading: None,
+    ///     note: None,
+    ///     cells: vec![GridCell::open(None)],
+    ///     tags: tags.iter().map(|t| (*t).to_string()).collect(),
+    /// };
+    /// let mut form = Form::new()
+    ///     .grid("packages", &["apt"], vec![
+    ///         row("ripgrep", &["terminal"]),
+    ///         row("zoom", &["gui", "spyware"]),
+    ///     ])
+    ///     .filters("Include", &[("terminal", "terminal-only"), ("gui", "GUI-only"),
+    ///                           ("spyware", "privacy-infringing")]);
+    ///
+    /// assert!(!form.filtered_out(0, 1), "everything shows to begin with");
+    /// form.excluded.insert("spyware".into());
+    /// assert!(form.filtered_out(0, 1), "…and clearing spyware removes it, gui tag or not");
+    /// assert!(!form.filtered_out(0, 0), "ripgrep carries neither tag");
+    /// ```
+    pub fn filters(mut self, label: impl Into<String>, tags: &[(&str, &str)]) -> Self {
+        self.filter_label = label.into();
+        self.filters = tags.iter().map(|(tag, said)| ((*tag).to_string(), (*said).to_string())).collect();
+        self
+    }
+
+    /// The tags carried by slot `slot` of item `index`.
+    #[must_use]
+    pub fn tags_at(&self, index: usize, slot: usize) -> &[String] {
+        match self.items.get(index) {
+            Some(Item::Checkboxes { options, .. } | Item::Radio { options, .. }) => {
+                options.get(slot).map_or(&[][..], |o| o.tags.as_slice())
+            }
+            Some(Item::Grid { rows, .. }) => rows.get(slot).map_or(&[][..], |row| &row.tags),
+            _ => &[],
+        }
+    }
+
+    /// Whether slot `slot` of item `index` carries a tag the user has cleared.
+    #[must_use]
+    pub fn filtered_out(&self, index: usize, slot: usize) -> bool {
+        !self.excluded.is_empty()
+            && self.tags_at(index, slot).iter().any(|tag| self.excluded.contains(tag))
+    }
+
+    /// Make the sub-titles fold (see `collapsible`). Every section opens expanded.
+    pub fn collapsible(mut self) -> Self {
+        self.collapsible = true;
+        self
+    }
+
+    /// Start with the section above `slot` of item `index` folded shut — for a form that opens
+    /// with the long sections out of the way. No effect unless [`Form::collapsible`] is also set,
+    /// and none if there is no heading at that slot.
+    pub fn folded(mut self, index: usize, slot: usize) -> Self {
+        self.collapsed.insert((index, slot));
+        self
+    }
+
+    /// The heading standing above slot `slot` of item `index`, if there is one.
+    ///
+    /// One place that knows where headings live, so the two shapes that have them — the parallel
+    /// `headings` of a choice group, and a grid row's own — are asked the same way.
+    #[must_use]
+    pub fn heading_at(&self, index: usize, slot: usize) -> Option<&str> {
+        match self.items.get(index)? {
+            Item::Checkboxes { options, .. } | Item::Radio { options, .. } => {
+                options.get(slot)?.heading.as_deref()
+            }
+            Item::Grid { rows, .. } => rows.get(slot)?.heading.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// How many slots item `index` has — options for a choice group, rows for a grid, none for
+    /// anything else.
+    pub(crate) fn slots(&self, index: usize) -> usize {
+        match self.items.get(index) {
+            Some(Item::Checkboxes { options, .. } | Item::Radio { options, .. }) => options.len(),
+            Some(Item::Grid { rows, .. }) => rows.len(),
+            _ => 0,
+        }
+    }
+
+    /// The heading that governs slot `slot` — the nearest one at or above it.
+    ///
+    /// A section runs from its own heading to the next. Slots before the FIRST heading belong to
+    /// no section at all and answer `None`: an item may open with a few loose options and only
+    /// later break into parts, and those first few can never be folded away.
+    pub(crate) fn section_head(&self, index: usize, slot: usize) -> Option<usize> {
+        (0..=slot).rev().find(|above| self.heading_at(index, *above).is_some())
+    }
+
+    /// The last slot belonging to the section opened at `head` — where its `^` goes.
+    pub(crate) fn section_tail(&self, index: usize, head: usize) -> usize {
+        (head + 1..self.slots(index))
+            .find(|slot| self.heading_at(index, *slot).is_some())
+            .unwrap_or_else(|| self.slots(index))
+            .saturating_sub(1)
+    }
+
+    /// Whether slot `slot` of item `index` is out of sight, folded away or filtered away.
+    ///
+    /// One predicate for both, because everything downstream — what draws, what the cursor can
+    /// reach — cares only THAT a row is not shown. Two would be two chances to check one and
+    /// forget the other.
+    pub(crate) fn hidden(&self, index: usize, slot: usize) -> bool {
+        let folded = self.collapsible
+            && self
+                .section_head(index, slot)
+                .is_some_and(|head| self.collapsed.contains(&(index, head)));
+        folded || self.filtered_out(index, slot)
+    }
+
+    /// Whether every slot of the section opened at `head` has been filtered away.
+    ///
+    /// A section emptied by a filter is not drawn at all. Leaving its `v`/`^` behind would fill
+    /// the screen with headings over nothing, which is the opposite of what a filter is for —
+    /// and folding an empty section is a control that does nothing.
+    pub(crate) fn section_emptied(&self, index: usize, head: usize) -> bool {
+        !self.filters.is_empty()
+            && (head..=self.section_tail(index, head))
+                .all(|slot| self.filtered_out(index, slot))
     }
 
     /// Strip colour codes from everything displayed (see `scrub_colors`).
@@ -447,9 +720,10 @@ impl Form {
     ///     ]
     /// "#;
     /// let form = Form::from_toml_with(text, |spec| spec.starts_with("installed:")).unwrap();
-    /// let Item::Checkboxes { checked, enabled, .. } = &form.items[0] else { panic!() };
-    /// assert_eq!(checked, &[true, false], "the machine already has zed");
-    /// assert_eq!(enabled, &[true, false], "and apt is not this user's to change");
+    /// let Item::Checkboxes { options, .. } = &form.items[0] else { panic!() };
+    /// assert_eq!(options[0].checked, true, "the machine already has zed");
+    /// assert_eq!(options[1].checked, false);
+    /// assert_eq!(options[1].enabled, false, "and apt is not this user's to change");
     /// ```
     pub fn from_toml_with(text: &str, resolve: impl Fn(&str) -> bool) -> Result<Self, String> {
         definition::from_toml(text, Some(&resolve))
@@ -474,13 +748,8 @@ impl Form {
         self.items
             .iter()
             .find_map(|item| match item {
-                Item::Checkboxes { label: l, options, checked, .. } if l == label => Some(
-                    options
-                        .iter()
-                        .zip(checked)
-                        .filter(|(_, on)| **on)
-                        .map(|(option, _)| option.as_str())
-                        .collect(),
+                Item::Checkboxes { label: l, options, .. } if l == label => Some(
+                    options.iter().filter(|o| o.checked).map(|o| o.name.as_str()).collect(),
                 ),
                 _ => None,
             })
@@ -492,10 +761,9 @@ impl Form {
     /// being trivially true against a field that isn't there.
     fn _checked_among(&self, label: &str, options: &[String]) -> Option<usize> {
         self.items.iter().find_map(|item| match item {
-            Item::Checkboxes { label: name, options: all, checked, .. } if name == label => Some(
+            Item::Checkboxes { label: name, options: all, .. } if name == label => Some(
                 all.iter()
-                    .zip(checked)
-                    .filter(|(name, on)| **on && options.iter().any(|want| want == *name))
+                    .filter(|o| o.checked && options.contains(&o.name))
                     .count(),
             ),
             _ => None,
@@ -517,7 +785,7 @@ impl Form {
     pub fn chosen(&self, label: &str) -> Option<&str> {
         self.items.iter().find_map(|item| match item {
             Item::Radio { label: l, options, chosen, .. } if l == label => {
-                chosen.map(|index| options[index].as_str())
+                chosen.and_then(|index| options.get(index)).map(|o| o.name.as_str())
             }
             _ => None,
         })
@@ -547,18 +815,17 @@ impl Form {
             }
             match item {
                 Item::Comment(_) => {}
-                Item::Checkboxes { label, options, checked, .. } => {
+                Item::Checkboxes { label, options, .. } => {
                     let picked: Vec<toml::Value> = options
                         .iter()
-                        .zip(checked)
-                        .filter(|(_, on)| **on)
-                        .map(|(option, _)| toml::Value::String(option.clone()))
+                        .filter(|o| o.checked)
+                        .map(|o| toml::Value::String(o.name.clone()))
                         .collect();
                     table.insert(label.clone(), toml::Value::Array(picked));
                 }
                 Item::Radio { label, options, chosen, .. } => {
-                    if let Some(index) = chosen {
-                        table.insert(label.clone(), toml::Value::String(options[*index].clone()));
+                    if let Some(option) = chosen.and_then(|index| options.get(index)) {
+                        table.insert(label.clone(), toml::Value::String(option.name.clone()));
                     }
                 }
                 Item::Text { label, value } => {
@@ -610,9 +877,9 @@ mod tests {
     #[test]
     fn accessors_read_back_what_was_set() {
         let mut form = sample();
-        let Item::Checkboxes { checked, .. } = &mut form.items[1] else { panic!() };
-        checked[0] = true;
-        checked[2] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[1] else { panic!() };
+        options[0].checked = true;
+        options[2].checked = true;
         let Item::Radio { chosen, .. } = &mut form.items[2] else { panic!() };
         *chosen = Some(1);
         let Item::Text { value, .. } = &mut form.items[3] else { panic!() };
@@ -638,9 +905,9 @@ mod tests {
                 Condition::CheckedAtLeast { label: "packages".into(), options: vpns, count: 2 },
             );
         let tick = |form: &mut Form, slots: &[usize]| {
-            let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
-            checked.iter_mut().for_each(|on| *on = false);
-            slots.iter().for_each(|slot| checked[*slot] = true);
+            let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+            options.iter_mut().for_each(|option| option.checked = false);
+            slots.iter().for_each(|slot| options[*slot].checked = true);
         };
 
         assert!(form.active_warnings().is_empty(), "nothing picked yet");
@@ -660,8 +927,8 @@ mod tests {
     #[test]
     fn a_condition_against_a_missing_group_stays_quiet() {
         let mut form = Form::new().checkboxes("Tops", &["a", "b"]).radio("Size", &["S", "M"]);
-        let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
-        checked[0] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
         let Item::Radio { chosen, .. } = &mut form.items[1] else { panic!() };
         *chosen = Some(1);
 
@@ -696,8 +963,8 @@ mod tests {
     #[test]
     fn combinators_nest_and_the_empty_cases_differ() {
         let mut form = Form::new().checkboxes("Tops", &["a", "b"]);
-        let Item::Checkboxes { checked, .. } = &mut form.items[0] else { panic!() };
-        checked[0] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
         let on = Condition::Checked { label: "Tops".into(), options: vec!["a".into()] };
         let off = Condition::Checked { label: "Tops".into(), options: vec!["b".into()] };
 
@@ -723,8 +990,8 @@ mod tests {
     #[test]
     fn answers_serialize_as_one_toml_document() {
         let mut form = sample();
-        let Item::Checkboxes { checked, .. } = &mut form.items[1] else { panic!() };
-        checked[1] = true;
+        let Item::Checkboxes { options, .. } = &mut form.items[1] else { panic!() };
+        options[1].checked = true;
         let Item::Text { value, .. } = &mut form.items[3] else { panic!() };
         *value = "Ada".into();
 
