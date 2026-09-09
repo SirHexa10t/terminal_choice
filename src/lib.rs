@@ -159,6 +159,8 @@ pub struct Choice {
     pub tags: Vec<String>,
     /// Whether `checked` is owed to a suggestion rather than a fact — see [`Choice::suggest`].
     pub suggested: bool,
+    /// Tags this option needs a COMPANION to carry — see [`Choice::requires`].
+    pub requires: Vec<String>,
 }
 
 impl Choice {
@@ -172,6 +174,7 @@ impl Choice {
             enabled: true,
             tags: Vec::new(),
             suggested: false,
+            requires: Vec::new(),
         }
     }
 
@@ -238,6 +241,78 @@ pub struct GridRow {
     /// already knows: `os_ricing` writes `package.tags` here in the same expression that writes
     /// the label. A second pass to attach them would be a second place to forget.
     pub tags: Vec<String>,
+    /// Tags this row needs a COMPANION to carry — see [`Form::unmet`]. Empty for almost every
+    /// row, which is why it is last.
+    pub requires: Vec<String>,
+}
+
+impl GridRow {
+    /// A row with a name, no cells and nothing else — everything past the label is exception.
+    ///
+    /// A builder, like [`Choice`] beside it and `software_inventory`'s `Package`, and for a
+    /// reason this struct learned the hard way: adding `requires` meant editing thirteen literal
+    /// constructions across two crates, twelve of which had nothing to say about it. The fields
+    /// stay public, because reading them is most of what happens to a row.
+    ///
+    /// A row with NO cells draws as a line of gaps, which is the same thing a short row already
+    /// does about the columns it does not reach. Nothing forbids it and nothing needs to.
+    ///
+    /// ```
+    /// # use terminal_choice::{GridCell, GridRow};
+    /// let row = GridRow::named("git")
+    ///     .heading("# tools")
+    ///     .note("version control")
+    ///     .cells(vec![GridCell::set(None)])
+    ///     .tags(&["vcs", "terminal"]);
+    /// assert_eq!(row.heading.as_deref(), Some("# tools"));
+    /// assert!(GridRow::named("bare").tags.is_empty());
+    /// ```
+    #[must_use]
+    pub fn named(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            heading: None,
+            note: None,
+            cells: Vec::new(),
+            tags: Vec::new(),
+            requires: Vec::new(),
+        }
+    }
+
+    /// The sub-title drawn above this row, breaking a long table into sections.
+    #[must_use]
+    pub fn heading(mut self, heading: impl Into<String>) -> Self {
+        self.heading = Some(heading.into());
+        self
+    }
+
+    /// The dim remark after the label — what the thing IS, where the name does not say.
+    #[must_use]
+    pub fn note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
+    }
+
+    /// The boxes, one per column.
+    #[must_use]
+    pub fn cells(mut self, cells: Vec<GridCell>) -> Self {
+        self.cells = cells;
+        self
+    }
+
+    /// What this row IS, for filtering — see [`Form::filters`].
+    #[must_use]
+    pub fn tags(mut self, tags: &[&str]) -> Self {
+        self.tags = tags.iter().map(|tag| (*tag).to_string()).collect();
+        self
+    }
+
+    /// Tags this row needs a companion to carry — see [`Form::unmet`].
+    #[must_use]
+    pub fn requires(mut self, tags: &[&str]) -> Self {
+        self.requires = tags.iter().map(|tag| (*tag).to_string()).collect();
+        self
+    }
 }
 
 /// One box of an [`Item::Grid`], and what it would do.
@@ -438,6 +513,24 @@ pub struct Form {
     /// Which filter boxes are currently CLEARED, by [`Rule::label`]. Display state, like
     /// `collapsed`: an entry filtered out of sight keeps every answer it had.
     pub excluded: std::collections::BTreeSet<String>,
+    /// Entries this machine cannot offer at all — greyed out, not hidden, and not the user's to
+    /// change. Each [`Rule::label`] says WHY, so a caller can explain itself.
+    ///
+    /// Deliberately not filter boxes, and the difference is who the answer belongs to. A filter
+    /// is a PREFERENCE, and a preference is revisable: "I do not much like terminal programs, but
+    /// this one looks worth a go" is a sentence somebody says, so the box has to let them say it.
+    /// Nobody revisably runs one program on a display server they are not running. That is the
+    /// machine's answer rather than the user's, so it greys the row instead of offering a box —
+    /// and greyed rather than hidden, because a reader should see that the choice exists and why
+    /// it is out of reach.
+    pub incompatible: Vec<Rule>,
+    /// At most ONE chosen entry may match each of these, form-wide. A second is a conflict, and
+    /// the form refuses to submit while it stands — see [`Form::objections`].
+    ///
+    /// Said in tags rather than as pairs of names: "at most one `display-manager`" is one line
+    /// however many display managers the catalogue grows, where a list of incompatible pairs is
+    /// quadratic and needs editing every time one is added.
+    pub exclusive: Vec<Rule>,
 }
 
 impl Form {
@@ -540,12 +633,8 @@ impl Form {
     ///
     /// ```
     /// # use terminal_choice::{Form, GridCell, GridRow};
-    /// let row = |label: &str, tags: &[&str]| GridRow {
-    ///     label: label.into(),
-    ///     heading: None,
-    ///     note: None,
-    ///     cells: vec![GridCell::open(None)],
-    ///     tags: tags.iter().map(|t| (*t).to_string()).collect(),
+    /// let row = |label: &str, tags: &[&str]| {
+    ///     GridRow::named(label).cells(vec![GridCell::open(None)]).tags(tags)
     /// };
     /// let mut form = Form::new()
     ///     .grid("packages", &["apt"], vec![
@@ -593,6 +682,25 @@ impl Form {
         }
     }
 
+    /// Every box of the filter block, in display order: the ones the caller offered, then one
+    /// per incompatibility rule.
+    ///
+    /// An incompatibility gets a box FOR FREE, and that is the whole reason the two lists join
+    /// here rather than being drawn separately. A rule that locks entries away has already
+    /// decided they cannot be picked; all a box adds is the choice to stop looking at them. It
+    /// hides nothing the user could have had — which is what makes it safe to offer, and
+    /// different in kind from every other box in the block.
+    ///
+    /// It also answers the question the greying could not. A dim row with no explanation is a
+    /// puzzle; a dim row plus a box saying `incompatible display server` is a sentence. The
+    /// label does both jobs, which is why there is one string and not two.
+    ///
+    /// [`Rule::label`] is the identity in [`Form::excluded`], so a label repeated across the two
+    /// lists would make one box work the other's rows. Keep them distinct.
+    pub fn filter_boxes(&self) -> impl Iterator<Item = &Rule> {
+        self.filters.iter().chain(self.incompatible.iter())
+    }
+
     /// Whether slot `slot` of item `index` carries a tag the user has cleared.
     #[must_use]
     pub fn filtered_out(&self, index: usize, slot: usize) -> bool {
@@ -600,10 +708,151 @@ impl Form {
             return false;
         }
         let tags = self.tags_at(index, slot);
-        self.filters
-            .iter()
+        self.filter_boxes()
             .filter(|rule| self.excluded.contains(&rule.label))
             .any(|rule| rule.matches(tags))
+    }
+
+    /// Grey out every entry matching one of `rules` — see [`Form::incompatible`].
+    ///
+    /// Each pair is the rule's terms and the reason: `(&["wayland-only"], "this session is X11")`.
+    /// Terms take the same `!` negation [`Rule::of`] reads everywhere else.
+    pub fn incompatible(mut self, rules: &[(&[&str], &str)]) -> Self {
+        self.incompatible = rules.iter().map(|(terms, why)| Rule::of(*why, terms)).collect();
+        self
+    }
+
+    /// Allow at most one chosen entry per rule — see [`Form::exclusive`].
+    pub fn exclusive(mut self, rules: &[(&[&str], &str)]) -> Self {
+        self.exclusive = rules.iter().map(|(terms, said)| Rule::of(*said, terms)).collect();
+        self
+    }
+
+    /// Whether slot `slot` of item `index` is one this machine cannot offer, and why.
+    ///
+    /// Evaluated on demand rather than baked into each entry's `enabled` at build time, so that
+    /// the answer cannot depend on the order a form was assembled in — the same reason
+    /// [`Form::filtered_out`] is a question and not a stored flag.
+    #[must_use]
+    pub fn incompatible_at(&self, index: usize, slot: usize) -> Option<&Rule> {
+        if self.incompatible.is_empty() {
+            return None;
+        }
+        let tags = self.tags_at(index, slot);
+        self.incompatible.iter().find(|rule| rule.matches(tags))
+    }
+
+    /// Whether slot `slot` of item `index` is CHOSEN — ticked, picked, or, in a grid, ticked in
+    /// any column at all.
+    ///
+    /// A grid row is chosen if any one of its cells is, because the columns are ways of having
+    /// the same thing: a package installed through apt is installed.
+    #[must_use]
+    pub fn chosen_at(&self, index: usize, slot: usize) -> bool {
+        match self.items.get(index) {
+            Some(Item::Checkboxes { options, .. }) => {
+                options.get(slot).is_some_and(|entry| entry.checked)
+            }
+            Some(Item::Radio { chosen, .. }) => *chosen == Some(slot),
+            Some(Item::Grid { rows, .. }) => {
+                rows.get(slot).is_some_and(|row| row.cells.iter().any(|cell| cell.checked))
+            }
+            _ => false,
+        }
+    }
+
+    /// The tags slot `slot` of item `index` needs a companion to carry.
+    #[must_use]
+    pub fn requires_at(&self, index: usize, slot: usize) -> &[String] {
+        match self.items.get(index) {
+            Some(Item::Checkboxes { options, .. } | Item::Radio { options, .. }) => {
+                options.get(slot).map_or(&[][..], |entry| entry.requires.as_slice())
+            }
+            Some(Item::Grid { rows, .. }) => {
+                rows.get(slot).map_or(&[][..], |row| row.requires.as_slice())
+            }
+            _ => &[],
+        }
+    }
+
+    /// Every tag some chosen entry demands and no chosen entry supplies, in the order first
+    /// demanded and without repeats.
+    ///
+    /// "At least one of EACH", not one of the list: an entry requiring two tags needs a companion
+    /// for both, or two requirements would collapse into one that either could answer.
+    ///
+    /// An entry may satisfy its own requirement, and that is not a loophole worth closing — a
+    /// package tagged as the backend it needs really does supply it.
+    #[must_use]
+    pub fn unmet(&self) -> Vec<String> {
+        let chosen: Vec<(usize, usize)> = (0..self.items.len())
+            .flat_map(|index| (0..self.slots(index)).map(move |slot| (index, slot)))
+            .filter(|(index, slot)| self.chosen_at(*index, *slot))
+            .collect();
+        let supplied = |want: &String| {
+            chosen.iter().any(|(index, slot)| self.tags_at(*index, *slot).contains(want))
+        };
+        let mut missing: Vec<String> = Vec::new();
+        for (index, slot) in &chosen {
+            for want in self.requires_at(*index, *slot) {
+                if !supplied(want) && !missing.contains(want) {
+                    missing.push(want.clone());
+                }
+            }
+        }
+        missing
+    }
+
+    /// Whether slot `slot` of item `index` would answer something currently demanded — the rows
+    /// a form turns green to say "pick one of these".
+    #[must_use]
+    pub fn wanted_at(&self, index: usize, slot: usize) -> bool {
+        self.wanted_among(&self.unmet(), index, slot)
+    }
+
+    /// [`Form::wanted_at`], against a [`Form::unmet`] the caller computed once.
+    ///
+    /// The split exists for the repaint: `unmet` walks every slot, and asking it fresh per row
+    /// would make drawing quadratic in the table's length — unnoticeable at sixty rows and a
+    /// stutter at the six hundred the catalogue is heading for. One computation per frame, then
+    /// this per row.
+    #[must_use]
+    pub fn wanted_among(&self, unmet: &[String], index: usize, slot: usize) -> bool {
+        if unmet.is_empty() || self.chosen_at(index, slot) {
+            return false; // already taken; the green is for the ones still to pick from
+        }
+        let tags = self.tags_at(index, slot);
+        unmet.iter().any(|want| tags.contains(want))
+    }
+
+    /// The exclusivity rules more than one chosen entry matches — see [`Form::exclusive`].
+    #[must_use]
+    pub fn conflicts(&self) -> Vec<&Rule> {
+        self.exclusive
+            .iter()
+            .filter(|rule| {
+                let hits = (0..self.items.len())
+                    .flat_map(|index| (0..self.slots(index)).map(move |slot| (index, slot)))
+                    .filter(|(index, slot)| self.chosen_at(*index, *slot))
+                    .filter(|(index, slot)| rule.matches(self.tags_at(*index, *slot)))
+                    .count();
+                hits > 1
+            })
+            .collect()
+    }
+
+    /// Every reason this form refuses to be submitted, as lines to show. Empty means it will go.
+    ///
+    /// The two sources meet HERE and nowhere else. A conflict is a fact about the catalogue —
+    /// one rule over the whole form, at most one — and a requirement is a fact about an entry in
+    /// it — one rule per entry, at least one. They are stated in different places for that
+    /// reason, and they arrive at the same button, which is why the refusal is one function
+    /// rather than two competing ones.
+    #[must_use]
+    pub fn objections(&self) -> Vec<String> {
+        let conflicts = self.conflicts().into_iter().map(|rule| rule.label.clone());
+        let unmet = self.unmet().into_iter().map(|want| format!("nothing chosen is `{want}`"));
+        conflicts.chain(unmet).collect()
     }
 
     /// Make the sub-titles fold (see `collapsible`). Every section opens expanded.
@@ -681,7 +930,7 @@ impl Form {
     /// the screen with headings over nothing, which is the opposite of what a filter is for —
     /// and folding an empty section is a control that does nothing.
     pub(crate) fn section_emptied(&self, index: usize, head: usize) -> bool {
-        !self.filters.is_empty()
+        self.filter_boxes().next().is_some()
             && (head..=self.section_tail(index, head))
                 .all(|slot| self.filtered_out(index, slot))
     }
@@ -1091,5 +1340,126 @@ mod tests {
             Some("O'Brien \"Bob\""),
             "keys and values survive quoting"
         );
+    }
+
+    // ——— requirements, conflicts, and what they do to Submit ———————————————
+
+    /// A grid of packages, each row one tag and one requirement, ticked where `on` says.
+    fn table(rows: &[(&str, &[&str], &[&str], bool)]) -> Form {
+        Form::new().grid(
+            "",
+            &["apt"],
+            rows.iter()
+                .map(|(name, tags, requires, on)| {
+                    GridRow::named(*name)
+                        .cells(vec![if *on { GridCell::set(None) } else { GridCell::open(None) }])
+                        .tags(tags)
+                        .requires(requires)
+                })
+                .collect(),
+        )
+    }
+
+    /// The dependency is said in TAGS, so any of several packages can answer it — which is the
+    /// whole reason it is not said in names. Nothing is demanded until the dependent is chosen.
+    #[test]
+    fn a_requirement_names_a_kind_of_companion_not_a_particular_one() {
+        let nothing_picked =
+            table(&[("ncmpcpp", &[], &["audio-backend"], false), ("mpd", &["audio-backend"], &[], false)]);
+        assert!(nothing_picked.unmet().is_empty(), "an unchosen entry demands nothing");
+
+        let unmet = table(&[
+            ("ncmpcpp", &[], &["audio-backend"], true),
+            ("mpd", &["audio-backend"], &[], false),
+            ("mpv", &[], &[], false),
+        ]);
+        assert_eq!(unmet.unmet(), ["audio-backend"]);
+        assert!(unmet.wanted_at(0, 1), "mpd would answer it, so it goes green");
+        assert!(!unmet.wanted_at(0, 2), "mpv would not");
+        assert!(!unmet.wanted_at(0, 0), "nor does the entry that is asking");
+
+        let met = table(&[
+            ("ncmpcpp", &[], &["audio-backend"], true),
+            ("mpd", &["audio-backend"], &[], true),
+        ]);
+        assert!(met.unmet().is_empty(), "a chosen supplier settles it");
+        assert!(!met.wanted_at(0, 1), "and the green stops the moment it is picked");
+    }
+
+    /// "At least one of EACH", not one of the list. Two demands collapsing into one that either
+    /// could answer is the mistake this pins down.
+    #[test]
+    fn two_requirements_need_two_companions() {
+        let half = table(&[
+            ("thing", &[], &["audio-backend", "session"], true),
+            ("mpd", &["audio-backend"], &[], true),
+            ("wayland-session", &["session"], &[], false),
+        ]);
+        assert_eq!(half.unmet(), ["session"], "one answered, one still open");
+
+        // An entry may answer its own demand: a package tagged as the backend it needs really
+        // does supply it, and calling that a loophole would forbid a true statement.
+        let itself = table(&[("mpd", &["audio-backend"], &["audio-backend"], true)]);
+        assert!(itself.unmet().is_empty());
+    }
+
+    /// Exclusivity is one rule over the WHOLE form, and it takes two chosen entries to break —
+    /// which is the difference between "at most one" and "none".
+    #[test]
+    fn at_most_one_chosen_entry_may_match_an_exclusive_rule() {
+        let one_of_each = |a: bool, b: bool| {
+            let mut form = table(&[("gdm", &["display-manager"], &[], a), ("sddm", &["display-manager"], &[], b)]);
+            form.exclusive = vec![Rule::of("only one display manager", &["display-manager"])];
+            form
+        };
+        assert!(one_of_each(false, false).conflicts().is_empty(), "none is fine");
+        assert!(one_of_each(true, false).conflicts().is_empty(), "one is the point");
+        let both = one_of_each(true, true);
+        assert_eq!(both.conflicts().len(), 1);
+        assert_eq!(both.objections(), ["only one display manager"]);
+    }
+
+    /// The two sources meet at the button and only there — a fact about the catalogue and a fact
+    /// about an entry in it, arriving as one list of reasons not to go.
+    #[test]
+    fn objections_gather_both_kinds_and_are_empty_when_the_form_is_sound() {
+        let mut form = table(&[
+            ("gdm", &["display-manager"], &[], true),
+            ("sddm", &["display-manager"], &[], true),
+            ("ncmpcpp", &[], &["audio-backend"], true),
+        ]);
+        form.exclusive = vec![Rule::of("only one display manager", &["display-manager"])];
+        assert_eq!(
+            form.objections(),
+            ["only one display manager", "nothing chosen is `audio-backend`"]
+        );
+
+        let sound = table(&[("ncmpcpp", &[], &["audio-backend"], true), ("mpd", &["audio-backend"], &[], true)]);
+        assert!(sound.objections().is_empty(), "nothing to say, so it may go");
+    }
+
+    /// A grid row is chosen if ANY of its columns is: the columns are ways of having the same
+    /// thing, and a package installed through apt is installed.
+    #[test]
+    fn a_grid_row_counts_as_chosen_through_any_one_column() {
+        let form = Form::new().grid(
+            "",
+            &["apt", "flatpak"],
+            vec![GridRow::named("brave").cells(vec![GridCell::open(None), GridCell::set(None)]).tags(&["browser"])],
+        );
+        assert!(form.chosen_at(0, 0), "ticked in the second column, so it is had");
+    }
+
+    /// Greying is a claim about the MACHINE, so it is a rule the caller supplies rather than
+    /// state on the entry — and it says why, which is what the label is for.
+    #[test]
+    fn an_incompatible_entry_is_named_by_its_tags_and_carries_its_reason() {
+        let form = table(&[("hyprland", &["wayland-only"], &[], false), ("i3", &["x11-only"], &[], false)])
+            .incompatible(&[(&["wayland-only"], "this session is X11")]);
+        assert_eq!(form.incompatible_at(0, 0).map(|rule| rule.label.as_str()), Some("this session is X11"));
+        assert_eq!(form.incompatible_at(0, 1), None, "i3 is the one that runs here");
+
+        // No rules at all is the common case and must not cost a tag lookup per row.
+        assert_eq!(table(&[("i3", &["x11-only"], &[], false)]).incompatible_at(0, 0), None);
     }
 }

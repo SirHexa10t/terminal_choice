@@ -34,6 +34,9 @@ impl Choices {
                 enabled: self.enabled.get(at).copied().unwrap_or(true),
                 tags: Vec::new(),
                 suggested: false,
+                // A TOML definition states no tags, so it can state no tag requirement either —
+                // there would be nothing for one to name. Both arrive from code.
+                requires: Vec::new(),
             })
             .collect()
     }

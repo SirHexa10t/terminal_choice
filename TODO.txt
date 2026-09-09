@@ -1,0 +1,2 @@
+
+shortcut (key) for adding/removing extra column per line (save on vertical space)
