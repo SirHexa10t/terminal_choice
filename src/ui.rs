@@ -79,11 +79,15 @@ impl Opened {
         )
     }
 
+    /// Whether the box at `item`/`row`/`slot` arrived ticked — a fact about the machine, which is
+    /// what earns it the [`GIVEN`] glyph while it stands and the red mark when it is cleared.
+    fn ticked(&self, item: usize, row: usize, slot: usize) -> bool {
+        self.0.get(item).and_then(|rows| rows.get(row)).and_then(|ticks| ticks.get(slot)) == Some(&true)
+    }
+
     /// Whether the box at `item`/`row`/`slot` arrived ticked and `now` is clear.
     fn cleared(&self, item: usize, row: usize, slot: usize, now: bool) -> bool {
-        !now
-            && self.0.get(item).and_then(|rows| rows.get(row)).and_then(|ticks| ticks.get(slot))
-                == Some(&true)
+        !now && self.ticked(item, row, slot)
     }
 }
 
@@ -115,6 +119,19 @@ fn _folds(form: &Form, item: usize, slot: usize, foot: bool) -> Option<Focus> {
     Some(Focus::Section { item, slot: head, foot })
 }
 
+/// The fold row at `slot` of `item` the cursor may rest on: the section's TITLE — `>` shut, `v`
+/// open — and never its `^` closing line, which is drawn but skipped.
+///
+/// Both ends used to be stops, and every walk down the form paid two keystrokes per section for
+/// rows that only ever did one thing. The closing line lost its stop for good: Tab folds a section
+/// from inside it, so the `^` had no job left. The title briefly lost its stop too, and got it
+/// back: a section whose every entry is disabled or greyed has nothing inside for the cursor to
+/// rest on, and with no title to land on either it could be opened and never folded again. One
+/// stop per section is the price of never stranding a block open.
+fn _fold_stop(form: &Form, item: usize, slot: usize) -> Option<Focus> {
+    _folds(form, item, slot, false)
+}
+
 /// The focusable rows of `form`, in display order, always ending with Submit.
 pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
     let mut rows: Vec<Focus> =
@@ -128,7 +145,7 @@ pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
             // absent for the same reason, and the cursor cannot land on what is not drawn.
             Item::Checkboxes { options, .. } | Item::Radio { options, .. } => {
                 for (option, entry) in options.iter().enumerate() {
-                    rows.extend(_folds(form, index, option, false));
+                    rows.extend(_fold_stop(form, index, option));
                     // Greyed by an incompatibility gets no row either, and for the same reason
                     // a disabled one does not: the cursor cannot reach what does not exist here.
                     if entry.enabled
@@ -137,7 +154,6 @@ pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
                     {
                         rows.push(Focus::Option { item: index, option });
                     }
-                    rows.extend(_folds(form, index, option, true));
                 }
             }
             Item::Text { .. } => rows.push(Focus::Text { item: index }),
@@ -150,7 +166,7 @@ pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
             // to reach nothing.
             Item::Grid { rows: grid, .. } => {
                 for (row, entry) in grid.iter().enumerate() {
-                    rows.extend(_folds(form, index, row, false));
+                    rows.extend(_fold_stop(form, index, row));
                     if !form.hidden(index, row) && form.incompatible_at(index, row).is_none() {
                         rows.extend(
                             entry.cells.iter().enumerate().filter(|(_, cell)| cell.enabled).map(
@@ -158,7 +174,6 @@ pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
                             ),
                         );
                     }
-                    rows.extend(_folds(form, index, row, true));
                 }
             }
         }
@@ -184,7 +199,7 @@ pub(crate) enum Action {
 }
 
 /// The whole keyboard contract, in one testable place:
-/// - ↑/↓ (and Tab) move focus over the interactive rows, wrapping; comments are never visited.
+/// - ↑/↓ move focus over the interactive rows, wrapping; comments are never visited.
 /// - Space toggles a checkbox or picks a radio — except in a text field, where it types.
 /// - Printable keys type into the focused text field; Backspace erases.
 /// - Enter confirms Submit, and elsewhere hops to the next row (fill, Enter, fill, Enter…).
@@ -193,6 +208,16 @@ pub(crate) enum Action {
 ///   for Ctrl+A and Ctrl+Shift+A — they cannot be told apart. (`console` maps that byte to
 ///   `Key::Home`, so the physical Home key does the same, harmlessly.) Radios and text fields
 ///   are untouched: "all" is only a meaningful answer for choose-many.
+/// - Ctrl+S submits from anywhere — unless an objection stands, in which case it does nothing,
+///   exactly as Enter on a blocked Submit does. Arrives as [`CTRL_S`]: `console` leaves control
+///   bytes it has no name for as `Key::Char`, and raw mode has cleared the flow-control meaning
+///   the byte would otherwise have.
+/// - Tab folds the section the cursor is in, and unfolds a shut one from its `>`. Folding lands
+///   the cursor on that `>`; opening lands it on the first entry inside, or on the title when
+///   nothing inside can be selected. A section's title is a stop whether open or shut; its `^`
+///   closing line is drawn and skipped — with Tab folding from inside, a stop there had no job.
+///   Tab does nothing outside a section, or in a form that does not fold. It used to be another
+///   ↓; a grid already walks rows with ↓, and folding needed a key that works from INSIDE a block.
 /// - Esc cancels.
 pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key) -> Action {
     let editing_text = matches!(rows[*focus], Focus::Text { .. });
@@ -238,7 +263,9 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
         // list — which is how the cursor gets out of a table and down to Submit.
         // On a fold row the arrows do what they do in every tree: left shuts, right opens. They
         // are free to — sideways movement means nothing on a row that is not in a grid — and it
-        // spares the one-key ambiguity of space having to guess which way you meant.
+        // spares the one-key ambiguity of space having to guess which way you meant. Opening
+        // lands the cursor inside the section (see `_refocus_fold`); shutting leaves it on the
+        // `>`. Tab does the same from inside a section, where its title is out of reach.
         Key::ArrowLeft | Key::ArrowRight if matches!(rows[*focus], Focus::Section { .. }) => {
             let Focus::Section { item, slot, .. } = rows[*focus] else { unreachable!() };
             let shut = key == Key::ArrowLeft;
@@ -258,13 +285,40 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
                 None => return Action::Ignored,
             }
         }
-        Key::ArrowDown | Key::Tab => {
+        Key::ArrowDown => {
             *focus = _across_rows(rows, *focus, true)
                 .unwrap_or_else(|| (*focus + 1) % rows.len());
+        }
+        Key::Tab => {
+            if !form.collapsible {
+                return Action::Ignored;
+            }
+            let (item, slot) = match rows[*focus] {
+                Focus::Section { item, slot, .. } => (item, slot),
+                Focus::Option { item, option: slot } | Focus::Cell { item, row: slot, .. } => {
+                    match form.section_head(item, slot) {
+                        Some(head) => (item, head),
+                        None => return Action::Ignored, // loose rows above the first heading
+                    }
+                }
+                Focus::Filter { .. } | Focus::Text { .. } | Focus::Submit => return Action::Ignored,
+            };
+            let shut = !form.collapsed.remove(&(item, slot));
+            if shut {
+                form.collapsed.insert((item, slot));
+            }
+            _refocus_fold(form, focus, item, slot, shut);
         }
         Key::ArrowUp => {
             *focus = _across_rows(rows, *focus, false)
                 .unwrap_or_else(|| (*focus + rows.len() - 1) % rows.len());
+        }
+        // Before the general `Char` arm below, which would otherwise type this into a text field.
+        Key::Char(CTRL_S) => {
+            return match form.objections().is_empty() {
+                true => Action::Submit,
+                false => Action::Ignored,
+            };
         }
         Key::Enter => match rows[*focus] {
             // Refused rather than submitted, and NOT silently: the objections are already drawn
@@ -460,17 +514,36 @@ fn _frame(lines: &[String], previous: usize) -> String {
     out
 }
 
-/// Put the cursor back on the section that was just folded or unfolded.
+/// Put the cursor somewhere sensible after a section was just folded or unfolded.
 ///
 /// Folding removes rows and unfolding adds them, so the index the cursor held is about to name a
-/// different row. It is re-found by IDENTITY rather than arithmetic: the head row of the same
-/// section, in the list as it now stands.
-///
-/// Always the head, even when the foot is what was pressed. A shut section has no foot to return
-/// to, and after a long section folds upward the head is where the eye already is.
-fn _refocus_fold(form: &Form, focus: &mut usize, item: usize, slot: usize, _shut: bool) {
-    let head = Focus::Section { item, slot, foot: false };
-    if let Some(at) = focusables(form).iter().position(|row| *row == head) {
+/// different row. It is re-found by IDENTITY rather than arithmetic, in the list as it now
+/// stands: a section just SHUT leaves the cursor on its `>`, and one just OPENED puts it on the
+/// first entry inside — or on its `v` when nothing inside can be selected, so that it can always
+/// be folded again.
+fn _refocus_fold(form: &Form, focus: &mut usize, item: usize, slot: usize, shut: bool) {
+    let rows = focusables(form);
+    let landing = match shut {
+        // Shut: the `>` that now stands for the whole section — the one fold row that is a stop.
+        true => rows.iter().position(|row| *row == Focus::Section { item, slot, foot: false }),
+        // Opened: the first entry inside, because the point of opening a section is to get at
+        // what it holds, and landing on its name would be one more key before anything could be
+        // done. A section with nothing selectable inside falls back to its title — the one row
+        // that is always there, and the one that can fold it again.
+        false => {
+            let tail = form.section_tail(item, slot);
+            let title = Focus::Section { item, slot, foot: false };
+            rows.iter()
+                .position(|row| match row {
+                    Focus::Option { item: i, option: s } | Focus::Cell { item: i, row: s, .. } => {
+                        *i == item && (slot..=tail).contains(s)
+                    }
+                    _ => false,
+                })
+                .or_else(|| rows.iter().position(|row| *row == title))
+        }
+    };
+    if let Some(at) = landing {
         *focus = at;
     }
 }
@@ -686,12 +759,20 @@ pub(crate) fn compose(
         if !form.filter_label.is_empty() {
             lines.push(violet(format!("{}:", form.filter_label)));
         }
-        for (at, rule) in form.filter_boxes().enumerate() {
+        // Each box says how many entries it governs, and the counts stand in a column of their
+        // own: labels padded to the widest, counts right-aligned to the widest. A ragged column
+        // of numbers is harder to compare than no numbers.
+        let boxes: Vec<_> = form.filter_boxes().map(|rule| (rule, form.governed(rule))).collect();
+        let label_width =
+            boxes.iter().map(|(rule, _)| console::measure_text_width(&rule.label)).max().unwrap_or(0);
+        let count_width = boxes.iter().map(|(_, count)| count.to_string().len()).max().unwrap_or(1);
+        for (at, (rule, count)) in boxes.iter().enumerate() {
             let box_mark = if form.excluded.contains(&rule.label) { "[ ]" } else { "[x]" };
+            let pad = " ".repeat(label_width - console::measure_text_width(&rule.label));
             // Coloured BEFORE the focus mark, so the re-arming below carries the violet's own
             // reset through the reverse video instead of being cut short by it — the same order
             // the cleared-box red is applied in.
-            let row = violet(format!("{box_mark} {}", rule.label));
+            let row = violet(format!("{box_mark} {}{pad} ({count:>count_width$})", rule.label));
             lines.push(match rows.get(focus) == Some(&Focus::Filter { at }) {
                 true => format!("\x1b[7m▸ {}\x1b[0m", row.replace("\x1b[0m", "\x1b[0m\x1b[7m")),
                 false => format!("  {row}"),
@@ -739,7 +820,7 @@ pub(crate) fn compose(
                         lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
                         continue;
                     }
-                    let box_mark = if entry.checked { "[x]" } else { "[ ]" };
+                    let box_mark = _box(entry.checked, opened.ticked(index, 0, option));
                     let row = format!("{box_mark} {}", clean(entry.name.clone()));
                     // Colour BEFORE the focus mark, so that `mark`'s re-arming carries its reset
                     // through the reverse video rather than being cut short by it.
@@ -847,7 +928,16 @@ pub(crate) fn compose(
                     .zip(&slots)
                     .map(|(column, slot)| format!("{column}{}", pad(column, *slot)))
                     .collect();
-                lines.push(console::style(format!("{lead}{heads}")).dim().to_string());
+                let header = console::style(format!("{lead}{heads}")).dim().to_string();
+                // A folding grid repeats the header under every open title (below), so its own
+                // copy at the top would head nothing but the first title — dropped, unless loose
+                // rows come before that title and have no copy to read from. A grid that does not
+                // fold gets no copies, and keeps the one header it always had.
+                let titled_from_the_top =
+                    form.collapsible && grid.first().is_some_and(|row| row.heading.is_some());
+                if !titled_from_the_top {
+                    lines.push(header.clone());
+                }
 
                 // Labels align into a column, so the notes after them do too — a ragged right
                 // edge of `#` remarks is harder to read past than no remarks at all.
@@ -857,11 +947,22 @@ pub(crate) fn compose(
                     .max()
                     .unwrap_or(0);
                 for (row, entry) in grid.iter().enumerate() {
-                    match form.collapsible {
-                        true => lines.extend(_fold_lines(form, index, row, false, rows, focus, &clean)),
-                        false => {
-                            lines.extend(subtitle(&entry.heading, "", &clean));
-                        }
+                    let title = match form.collapsible {
+                        true => _fold_lines(form, index, row, false, rows, focus, &clean),
+                        false => subtitle(&entry.heading, "", &clean),
+                    };
+                    // In a folding grid every open block repeats the column headers under its
+                    // title. A table long enough to scroll is one where the headers at the top left
+                    // the screen rows ago, and a box in the fourth column then says nothing about
+                    // WHICH way of having the thing it is. A shut block has no boxes to head. The
+                    // copy is the same dim line, and no more selectable than the original. Plain
+                    // grids get none: their one header at the top stays, and nothing repeats it.
+                    let opens_a_block = form.collapsible
+                        && !title.is_empty()
+                        && !form.collapsed.contains(&(index, row));
+                    lines.extend(title);
+                    if opens_a_block {
+                        lines.push(header.clone());
                     }
                     if form.hidden(index, row) {
                         lines.extend(_fold_lines(form, index, row, true, rows, focus, &clean));
@@ -881,10 +982,7 @@ pub(crate) fn compose(
                         // `answers_toml` already drops them.
                         .take(columns.len())
                         .map(|(column, cell)| {
-                            let drawn = match cell.checked {
-                                true => "[x]",
-                                false => "[ ]",
-                            };
+                            let drawn = _box(cell.checked, opened.ticked(index, row, column));
                             // Padding is added AFTER any styling, so an escape never counts
                             // towards the width and the columns stay straight.
                             let inked = match (cell.boxed, cell.enabled && !greyed) {
@@ -973,10 +1071,15 @@ pub(crate) fn compose(
             lines.push(console::style(format!("{lead}{text}")).red().to_string());
         }
     }
+    // Only the keys this form answers to: a fold key on a form with nothing to fold would be a
+    // promise the form cannot keep.
+    let fold = if form.collapsible { " · tab fold/unfold" } else { "" };
     lines.push(
-        console::style("↑/↓/←/→ move · space picks · ctrl+a all/none · enter next/submit · esc cancels")
-            .dim()
-            .to_string(),
+        console::style(format!(
+            "↑/↓/←/→ move · space picks · ctrl+a all/none · ctrl+s submit{fold} · enter next/submit · esc cancels"
+        ))
+        .dim()
+        .to_string(),
     );
     // Found by its own marker rather than tracked through every push, because three places emit
     // focus (a row, a fold title, a grid cell) and one search cannot disagree with itself. It is
@@ -1085,9 +1188,15 @@ fn _fold_lines(
                 0 => format!("{arrow} "),
                 _ => "  ".to_string(),
             };
+            // The filter block's violet, because a fold title does the filter block's job: both
+            // decide what is on screen and neither is an answer. One colour for one kind of
+            // control, and a reader learns it once. The FOOT takes a darker shade of it: a `^`
+            // in the same violet as the `v` beneath it read as the next section beginning.
+            let shade = if foot { FOLD_FOOT_VIOLET } else { FILTER_VIOLET };
+            let text = console::style(format!("{lead}{said}")).color256(shade).to_string();
             match rows.get(focus) == Some(&here) && line == 0 {
-                true => format!("\x1b[7m▸ {lead}{said}\x1b[0m"),
-                false => format!("  {lead}{said}"),
+                true => format!("{FOCUS_ON}▸ {}\x1b[0m", text.replace("\x1b[0m", "\x1b[0m\x1b[7m")),
+                false => format!("  {text}"),
             }
         })
         .collect()
@@ -1145,12 +1254,44 @@ const LOCKED_GREY: u8 = 240;
 /// has been cleared) and grey already means switched-off, so violet is what was left unclaimed.
 const FILTER_VIOLET: u8 = 141;
 
+/// The `^` closing an open section: the same hue as [`FILTER_VIOLET`], two steps darker on the
+/// 256-colour cube, so the line that ENDS a section is not mistaken for the one that begins the
+/// next. Darker rather than `dim`, because terminals disagree about what faint does to a
+/// 256-colour foreground and agree about what colour 97 is.
+const FOLD_FOOT_VIOLET: u8 = 97;
+
 /// The blue a suggested tick is drawn in — 256-colour, as above.
 ///
 /// Blue says "the form put this here", where an uncoloured tick says "this is already so" and a
 /// red one says "you have undone something". Three states, three colours, and the middle one is
 /// the only one that is a recommendation rather than a report.
 const SUGGESTED_BLUE: u8 = 39;
+
+/// A box ticked by the MACHINE — installed already, or otherwise so when the form opened. The
+/// block is the cursor's own glyph, and the point is that it is not an `x`: nobody put it there,
+/// so a reader can tell the form's facts from their own choices at a glance. Clearing it undoes a
+/// fact and is marked red; ticking it again brings the block back rather than an `x`, because what
+/// the block says is "as it was when we started", and that is true again.
+const GIVEN: &str = "[█]";
+/// A box the user ticked — or one the form suggested, which is a tick that asserts nothing and is
+/// told apart by its colour rather than its glyph.
+const TICKED: &str = "[x]";
+const CLEAR: &str = "[ ]";
+
+/// The glyph for a box, from whether it is ticked now and whether it arrived that way.
+const fn _box(checked: bool, given: bool) -> &'static str {
+    match (checked, given) {
+        (true, true) => GIVEN,
+        (true, false) => TICKED,
+        (false, _) => CLEAR,
+    }
+}
+
+/// What ctrl+s arrives as. `console` names the control bytes it recognises (ctrl+a is
+/// `Key::Home`) and passes the rest through as the character they are; 0x13 is one of the rest.
+/// It reaches the program at all only because raw mode (`cfmakeraw`) clears `IXON` — in a cooked
+/// terminal the same byte is XOFF and freezes output instead.
+const CTRL_S: char = '\u{13}';
 
 /// The colour of an entry that would ANSWER something currently demanded — see [`Form::unmet`].
 ///
@@ -1553,7 +1694,7 @@ mod tests {
                 "  [ ] apt",
                 "",
                 "  [ Submit ]",
-                "↑/↓/←/→ move · space picks · ctrl+a all/none · enter next/submit · esc cancels",
+                "↑/↓/←/→ move · space picks · ctrl+a all/none · ctrl+s submit · enter next/submit · esc cancels",
             ],
             "{flat:#?}"
         );
@@ -1582,7 +1723,7 @@ mod tests {
         };
 
         // Focus parks on Submit throughout, so nothing here is the focus highlight's doing.
-        assert_eq!(row(&form, "on"), "  [x] on", "unchanged, unmarked");
+        assert_eq!(row(&form, "on"), "  [█] on", "unchanged, unmarked");
         assert_eq!(row(&form, "off"), "  [ ] off");
 
         // Clear the one that arrived ticked.
@@ -1598,7 +1739,7 @@ mod tests {
         // Put it back: the mark comes off as cleanly as it went on.
         let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
         options[0].checked = true;
-        assert_eq!(row(&form, "on"), "  [x] on");
+        assert_eq!(row(&form, "on"), "  [█] on");
     }
 
     /// Three managers, three packages, one unavailable everywhere but the middle — the shape the
@@ -1640,7 +1781,12 @@ mod tests {
             "and carries no marker: {flat:#?}"
         );
         assert_eq!(focusables(&plain).len(), 5, "four options and Submit — no section rows");
-        assert_eq!(focusables(&folding).len(), 9, "…plus a v and a ^ for each of two sections");
+        assert_eq!(focusables(&folding).len(), 7, "…plus a `v` for each of two sections; no `^` is a stop");
+        assert_eq!(
+            focusables(&folding.clone().folded(0, 0)).len(),
+            5,
+            "shut, `dev` keeps its title as `>` and loses its two options"
+        );
         // Nothing but the flag differs, so any render change is the flag's doing.
         assert_eq!(plain.items, folding.items, "folding never rewrites the items");
     }
@@ -1651,7 +1797,7 @@ mod tests {
         let lines = drawn(&sectioned().collapsible());
         let at = |want: &str| lines.iter().position(|line| line.trim() == want);
         assert_eq!(
-            (at("v dev"), at("[ ] git"), at("[x] jq"), at("^ dev")),
+            (at("v dev"), at("[ ] git"), at("[█] jq"), at("^ dev")),
             (Some(1), Some(2), Some(3), Some(4)),
             "{lines:#?}"
         );
@@ -1707,46 +1853,86 @@ mod tests {
         }
     }
 
-    /// Space flips a section either way; the arrows say which way, as they do in every tree.
+    /// Space or → on a shut section's `>` opens it, and the cursor lands on the first entry inside
+    /// rather than staying on the title. ← on a shut title has nothing left to do.
     #[test]
-    fn space_toggles_a_section_and_the_arrows_pick_a_direction() {
-        let mut form = sectioned().collapsible();
-        let mut focus = 0; // the `v dev` row is first
+    fn opening_a_shut_section_lands_the_cursor_on_its_first_entry() {
+        let mut form = sectioned().collapsible().folded(0, 0);
+        let mut focus = 0; // the `> dev` row is first
         let rows = focusables(&form);
         assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: false });
-
-        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Char(' ')), Action::Redraw);
-        assert!(form.collapsed.contains(&(0, 0)), "space shut it");
-        let rows = focusables(&form);
-        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: false }, "cursor held");
-
         assert_eq!(apply(&mut form, &rows, &mut focus, Key::ArrowLeft), Action::Ignored);
         assert!(form.collapsed.contains(&(0, 0)), "already shut — nothing to repaint");
-        assert_eq!(apply(&mut form, &rows, &mut focus, Key::ArrowRight), Action::Redraw);
-        assert!(!form.collapsed.contains(&(0, 0)), "right opens");
-        let rows = focusables(&form);
-        assert_eq!(apply(&mut form, &rows, &mut focus, Key::ArrowLeft), Action::Redraw);
-        assert!(form.collapsed.contains(&(0, 0)), "left shuts");
-    }
-
-    /// The foot folds too — the point of having one. Pressing it lands the cursor on the head,
-    /// because the foot it was standing on has just ceased to exist.
-    #[test]
-    fn the_closing_marker_folds_and_the_cursor_survives_it() {
-        let mut form = sectioned().collapsible();
-        let rows = focusables(&form);
-        let foot = Focus::Section { item: 0, slot: 0, foot: true };
-        let mut focus = rows.iter().position(|row| *row == foot).expect("an open section has a foot");
 
         assert_eq!(apply(&mut form, &rows, &mut focus, Key::Char(' ')), Action::Redraw);
-        assert!(form.collapsed.contains(&(0, 0)));
+        assert!(!form.collapsed.contains(&(0, 0)), "space opened it");
         let rows = focusables(&form);
-        assert!(focus < rows.len(), "the list shortened under the cursor");
-        assert_eq!(
-            rows[focus],
-            Focus::Section { item: 0, slot: 0, foot: false },
-            "moved to the head, which is where the section now is"
+        assert_eq!(rows[focus], Focus::Option { item: 0, option: 0 }, "and the cursor is inside");
+
+        // Fold it again from inside, and → reopens it from the `>` the same way.
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Tab), Action::Redraw);
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: false }, "back on the `>`");
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::ArrowRight), Action::Redraw);
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Option { item: 0, option: 0 }, "right opens, and lands inside");
+    }
+
+    /// A section's title is a stop, open or shut; its `^` closing line is drawn and skipped. So ↓
+    /// from the last entry of one open section lands on the next section's title, and ↓ again on
+    /// its first entry — the closing line is never in between.
+    #[test]
+    fn titles_are_stops_and_closing_markers_are_drawn_but_never_stops() {
+        let mut form = sectioned().collapsible();
+        let rows = focusables(&form);
+        assert!(
+            !rows.iter().any(|row| matches!(row, Focus::Section { foot: true, .. })),
+            "no closing line is a stop: {rows:#?}"
         );
+        assert_eq!(
+            rows.iter().filter(|row| matches!(row, Focus::Section { foot: false, .. })).count(),
+            2,
+            "both open titles are"
+        );
+        let shown: Vec<String> = render(&form, &rows, 0, 80, &[], &Opened::of(&form))
+            .iter()
+            .map(|line| console::strip_ansi_codes(line).trim().to_string())
+            .collect();
+        assert!(shown.iter().any(|line| line.starts_with("v ")), "the title is drawn: {shown:#?}");
+        assert!(shown.iter().any(|line| line.starts_with("^ ")), "and so is the closing line");
+
+        let mut focus = rows.iter().position(|row| *row == Focus::Option { item: 0, option: 1 }).unwrap();
+        apply(&mut form, &rows, &mut focus, Key::ArrowDown);
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 2, foot: false }, "over the `^`, onto `v web`");
+        apply(&mut form, &rows, &mut focus, Key::ArrowDown);
+        assert_eq!(rows[focus], Focus::Option { item: 0, option: 2 }, "then into it");
+    }
+
+    /// The case that put the title back: a section with nothing selectable inside. Opening it has
+    /// nowhere inside to land, so the cursor takes the title — which is the row that can fold it
+    /// again. Without that, a block could be opened once and never shut.
+    #[test]
+    fn opening_a_section_with_nothing_selectable_inside_lands_on_its_title() {
+        let mut form = Form::new()
+            .collapsible()
+            .grid(
+                "",
+                &["apt"],
+                vec![
+                    GridRow::named("locked").heading("out of reach").cells(vec![GridCell::locked(false)]),
+                    GridRow::named("live").heading("live").cells(vec![GridCell::open(None)]),
+                ],
+            )
+            .folded(0, 0);
+        let rows = focusables(&form);
+        let mut focus = 0; // the `> out of reach` row
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: false });
+        apply(&mut form, &rows, &mut focus, Key::ArrowRight);
+        assert!(!form.collapsed.contains(&(0, 0)), "opened");
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: false }, "nothing inside: the title");
+        apply(&mut form, &rows, &mut focus, Key::Tab);
+        assert!(form.collapsed.contains(&(0, 0)), "and it folds again from there");
     }
 
     /// Options standing before the first sub-title belong to no section, and nothing can fold
@@ -1831,14 +2017,14 @@ mod tests {
             [
                 // Leading spaces kept, not trimmed: the columns ARE the assertion. Every row of
                 // a folding grid — header, fold markers, boxes — starts at the same place.
-                "  apt  flatpak",
                 "  > Browsers",
                 "  v File managers",
+                "  apt  flatpak",
                 "  [ ]  [ ]      nautilus",
                 "  ^ File managers",
                 "",
                 "▸ [ Submit ]",
-                "↑/↓/←/→ move · space picks · ctrl+a all/none · enter next/submit · esc cancels",
+                "↑/↓/←/→ move · space picks · ctrl+a all/none · ctrl+s submit · tab fold/unfold · enter next/submit · esc cancels",
             ]
         );
         // …and without the flag, the table sits flush as it always did.
@@ -1857,7 +2043,7 @@ mod tests {
             vec![GridRow::named("git").cells(vec![GridCell::set(None), GridCell::set(None), GridCell::set(None)])],
         );
         // ["packages:", "apt", the row, …] — the label line, then the headings, then the boxes.
-        assert_eq!(drawn(&form)[2], "[x]  git", "one column drawn, the surplus dropped");
+        assert_eq!(drawn(&form)[2], "[█]  git", "one column drawn, the surplus dropped");
         assert!(form.answers_toml().contains("apt"), "and the answers agree: {}", form.answers_toml());
     }
 
@@ -1865,8 +2051,7 @@ mod tests {
     ///
     /// Not because folding loses anything — the answers are untouched, which the test above
     /// pins. Because the LIST is not data: it is the set of rows that exist to be landed on, and
-    /// a shut section has two fewer of them (its options) plus one less again (its `^`, which is
-    /// not drawn because there is nothing left to close).
+    /// a shut section has two fewer of them (its options); its title stays, `>` now where `v` was.
     ///
     /// Held here because `run`'s loop needs a terminal, so the staleness itself cannot be tested
     /// where it lives. This models the loop instead: take a list once, fold, and keep using it.
@@ -1875,12 +2060,12 @@ mod tests {
         let mut form = sectioned().collapsible();
         let stale = focusables(&form); // what a list taken once, before any key, would hold
         let mut focus = 0;
-        assert_eq!(stale[focus], Focus::Section { item: 0, slot: 0, foot: false });
-        apply(&mut form, &stale, &mut focus, Key::Char(' '));
+        assert_eq!(stale[focus], Focus::Section { item: 0, slot: 0, foot: false }, "`v dev` is first");
+        apply(&mut form, &stale, &mut focus, Key::Tab);
         assert!(form.collapsed.contains(&(0, 0)), "the first section is now shut");
 
         let fresh = focusables(&form);
-        assert_eq!((stale.len(), fresh.len()), (9, 6), "three rows stopped existing");
+        assert_eq!((stale.len(), fresh.len()), (7, 5), "two options stopped existing");
 
         // Step down against the list as it WAS. It lands on an option inside the shut section…
         let mut adrift = 0;
@@ -1960,7 +2145,7 @@ mod tests {
             lines.iter().find(|line| console::strip_ansi_codes(line).contains(want)).expect("drawn")
         };
 
-        assert_eq!(row("installed"), "  [x] installed", "already so — no colour");
+        assert_eq!(row("installed"), "  [█] installed", "already so — no colour");
         assert_eq!(
             row("recommended"),
             &format!("  {}", console::style("[x] recommended").color256(SUGGESTED_BLUE)),
@@ -2000,7 +2185,7 @@ mod tests {
         let boxed = |mark: &str| format!("{}  {mark}", console::style("[x]").color256(SUGGESTED_BLUE));
 
         assert_eq!(row_of(&form, "recommended"), boxed("recommended"), "suggested — blue");
-        assert_eq!(row_of(&form, "installed"), "[x]  installed", "already so — plain");
+        assert_eq!(row_of(&form, "installed"), "[█]  installed", "already so — plain");
 
         // Clear both. Only the one the form ASSERTED reddens.
         let Item::Grid { rows: grid, .. } = &mut form.items[0] else { panic!() };
@@ -2080,7 +2265,8 @@ mod tests {
         let lines = drawn(&form);
         assert_eq!(
             lines.iter().map(|l| l.trim()).take(5).collect::<Vec<_>>(),
-            ["Include:", "[x] terminal-only", "[x] GUI-only", "[x] spyware", ""],
+            // Each box counts what it governs, in a column: labels padded, counts right-aligned.
+            ["Include:", "[x] terminal-only (1)", "[x] GUI-only      (1)", "[x] spyware       (1)", ""],
             "{lines:#?}"
         );
         assert!(!form.answers_toml().contains("Include"), "{}", form.answers_toml());
@@ -2103,7 +2289,7 @@ mod tests {
         let lines = render(&form, &rows, rows.len() - 1, 200, &[], &Opened::of(&form));
 
         assert_eq!(lines[0], violet("Include:"), "the heading");
-        assert_eq!(lines[1], format!("  {}", violet("[x] terminal-only")), "and each box");
+        assert_eq!(lines[1], format!("  {}", violet("[x] terminal-only (1)")), "and each box");
         // The rows the filter GOVERNS keep the plain form every other entry has. Asserted as
         // equality rather than "is not violet": with colour off, `violet("")` is the empty
         // string and `contains` of it is true of everything — a check that could never fail.
@@ -2114,7 +2300,7 @@ mod tests {
         // row instead of stopping where the violet ends.
         let at = rows.iter().position(|row| *row == Focus::Filter { at: 0 }).unwrap();
         let focused = &render(&form, &rows, at, 200, &[], &Opened::of(&form))[1];
-        let styled = violet("[x] terminal-only");
+        let styled = violet("[x] terminal-only (1)");
         assert_eq!(
             *focused,
             format!("\x1b[7m▸ {}\x1b[0m", styled.replace("\x1b[0m", "\x1b[0m\x1b[7m"))
@@ -2416,8 +2602,9 @@ mod tests {
         )
     }
 
-    /// The layout: a heading row of truncated column names, a sub-title where one was given,
-    /// then one line per row — boxes, then the label. Unavailable cells are dim and not boxes at
+    /// The layout: a heading row of column names, a sub-title where one was given, then one line
+    /// per row — boxes, then the label. (A FOLDING grid repeats the names under each open title
+    /// instead; see `a_folding_grid_heads_each_open_block_instead_of_the_whole`.) Unavailable cells are dim and not boxes at
     /// all, so an eye scanning a column can tell "no" from "not offered".
     #[test]
     fn a_grid_draws_as_a_table_with_the_names_after_the_boxes() {
@@ -2434,9 +2621,9 @@ mod tests {
                 "packages:",
                 "apt  flatpak  snap",
                 "# tools",
-                "[x]   ·        ·    git      # version control",
+                "[█]   ·        ·    git      # version control",
                 "# browsers",
-                " ·   [x]      [ ]   brave",
+                " ·   [█]      [ ]   brave",
                 "[ ]  [ ]      [ ]   firefox",
             ],
             "{drawn:#?}"
@@ -2578,7 +2765,7 @@ mod tests {
         };
         assert_eq!(
             git_row(&form),
-            "[x]   ·        ·    git      # version control",
+            "[█]   ·        ·    git      # version control",
             "unchanged, unmarked"
         );
 
@@ -2893,7 +3080,8 @@ mod tests {
         let plain: Vec<String> =
             lines.iter().map(|l| console::strip_ansi_codes(l).into_owned()).collect();
         let all = plain.join("\n");
-        assert!(all.contains("[x] b") && all.contains("[ ] a"), "{all}");
+        // `b` was ticked before the snapshot was taken, so it is a fact and draws as the block.
+        assert!(all.contains("[█] b") && all.contains("[ ] a"), "{all}");
         assert!(all.contains("(•) S") && all.contains("( ) M"), "{all}");
         assert!(all.contains("can't touch this"), "comments render, dimmed: {all}");
         assert!(all.contains("[ Submit ]"), "{all}");
@@ -3181,36 +3369,36 @@ mod tests {
     // ——— fold rows are stops, and the screen follows the cursor ————————————
 
     /// The bug as it was met: in a folding grid, ↑/↓ stepped from cell to cell and straight over
-    /// the `v` and `^` rows between them, so no key could reach a fold row and nothing in a grid
-    /// could be folded. Both ends are stops now, and folding from the foot works.
+    /// the fold rows between them, so no key could reach one and nothing in a grid could be
+    /// folded. A title is a stop now, shut or open; opening lands inside, and the `^` is skipped.
     #[test]
-    fn arrows_in_a_folding_grid_stop_on_the_fold_rows() {
-        let mut form = Form::new().collapsible().grid(
-            "",
-            &["apt"],
-            vec![
-                GridRow::named("a1").heading("# one").cells(vec![GridCell::open(None)]),
-                GridRow::named("a2").cells(vec![GridCell::open(None)]),
-                GridRow::named("b1").heading("# two").cells(vec![GridCell::open(None)]),
-            ],
-        );
+    fn arrows_in_a_folding_grid_stop_on_titles_and_skip_closing_lines() {
+        let mut form = Form::new()
+            .collapsible()
+            .grid(
+                "",
+                &["apt"],
+                vec![
+                    GridRow::named("a1").heading("one").cells(vec![GridCell::open(None)]),
+                    GridRow::named("a2").cells(vec![GridCell::open(None)]),
+                    GridRow::named("b1").heading("two").cells(vec![GridCell::open(None)]),
+                ],
+            )
+            .folded(0, 2);
         let rows = focusables(&form);
-        let at = |want: Focus| rows.iter().position(|row| *row == want).expect("in the list");
-        let mut focus = at(Focus::Cell { item: 0, row: 1, column: 0 });
+        let mut focus = rows.iter().position(|row| *row == Focus::Cell { item: 0, row: 1, column: 0 }).unwrap();
 
         apply(&mut form, &rows, &mut focus, Key::ArrowDown);
-        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: true }, "the ^ under `one`");
-        apply(&mut form, &rows, &mut focus, Key::ArrowDown);
-        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 2, foot: false }, "the v over `two`");
-        apply(&mut form, &rows, &mut focus, Key::ArrowDown);
-        assert_eq!(rows[focus], Focus::Cell { item: 0, row: 2, column: 0 });
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 2, foot: false }, "the `>` of shut `two`");
+        apply(&mut form, &rows, &mut focus, Key::ArrowRight);
+        assert!(!form.collapsed.contains(&(0, 2)), "right opens it");
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Cell { item: 0, row: 2, column: 0 }, "and lands on b1, not the title");
         apply(&mut form, &rows, &mut focus, Key::ArrowUp);
-        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 2, foot: false }, "and back up onto it");
-
-        // A fold row reached this way folds: left on the foot of `one` shuts `one`.
-        focus = at(Focus::Section { item: 0, slot: 0, foot: true });
-        apply(&mut form, &rows, &mut focus, Key::ArrowLeft);
-        assert!(form.collapsed.contains(&(0, 0)), "the section the ^ belongs to is shut");
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 2, foot: false }, "back onto the open title");
+        apply(&mut form, &rows, &mut focus, Key::ArrowUp);
+        assert_eq!(rows[focus], Focus::Cell { item: 0, row: 1, column: 0 }, "over `one`'s `^`, onto a2");
+        assert!(!rows.iter().any(|row| matches!(row, Focus::Section { foot: true, .. })), "no `^` is a stop");
     }
 
     /// Moving between rows still lands in the nearest live column — the walk changed, the
@@ -3305,5 +3493,238 @@ mod tests {
 
         let on_submit = compose(&form, &rows, rows.len() - 1, 80, &[], &opened);
         assert_eq!(on_submit.focused, on_submit.foot + 1, "Submit is the footer's second line");
+    }
+
+    // ——— fold titles look like filter boxes, and filter boxes count ————————
+
+    /// A fold title is drawn in the filter block's violet, because it does the filter block's
+    /// job: both decide what is on screen, and neither is an answer. Styled expectations, as
+    /// every colour test here — see `the_filter_block_is_coloured_and_stays_coloured_under_the_cursor`.
+    #[test]
+    fn fold_titles_wear_the_filter_blocks_colour() {
+        let violet = |text: &str| console::style(text).color256(FILTER_VIOLET).to_string();
+        let form = Form::new()
+            .collapsible()
+            .grid(
+                "",
+                &["apt"],
+                vec![
+                    GridRow::named("a").heading("one").cells(vec![GridCell::open(None)]),
+                    GridRow::named("b").heading("two").cells(vec![GridCell::open(None)]),
+                ],
+            )
+            .folded(0, 1);
+        let rows = focusables(&form);
+        let lines = render(&form, &rows, rows.len() - 1, 80, &[], &Opened::of(&form));
+        let line = |want: &str| {
+            lines.iter().find(|line| console::strip_ansi_codes(line).trim() == want).expect("drawn").clone()
+        };
+        assert_eq!(line("v one"), format!("  {}", violet("v one")), "an open section's head");
+        assert_eq!(line("^ one"), format!("  {}", violet("^ one")), "and its foot");
+        assert_eq!(line("> two"), format!("  {}", violet("> two")), "a shut one");
+        assert_eq!(line("[ ]  a").trim_start(), "[ ]  a", "the entries themselves stay plain");
+    }
+
+    /// The counts stand in a column of their own — labels padded to the widest, counts
+    /// right-aligned to the widest — so `(15)` and `( 3)` end on the same character.
+    #[test]
+    fn filter_counts_line_up_whatever_their_width() {
+        let tagged = |name: String, tag: &str| {
+            GridRow::named(name).cells(vec![GridCell::open(None)]).tags(&[tag])
+        };
+        let rows: Vec<GridRow> = (0..15)
+            .map(|at| tagged(format!("l{at}"), "legacy"))
+            .chain((0..3).map(|at| tagged(format!("s{at}"), "spyware")))
+            .collect();
+        let form = Form::new()
+            .grid("", &["apt"], rows)
+            .filters("Include", &[(&["legacy"][..], "legacy"), (&["spyware"][..], "privacy")]);
+        let drawn: Vec<String> = drawn(&form)
+            .into_iter()
+            .filter(|line| line.contains("[x]"))
+            .map(|line| line.trim().to_string())
+            .collect();
+        assert_eq!(drawn, ["[x] legacy  (15)", "[x] privacy ( 3)"]);
+    }
+
+    // ——— ctrl+s and tab ———————————————————————————————————————————————————
+
+    /// Ctrl+S is Submit from wherever the cursor is, and obeys the same refusal: an objection
+    /// standing means the key does nothing, exactly as Enter on the dimmed button does.
+    #[test]
+    fn ctrl_s_submits_from_anywhere_unless_an_objection_stands() {
+        let mut form = Form::new().grid(
+            "",
+            &["apt"],
+            vec![
+                GridRow::named("ncmpcpp").cells(vec![GridCell::set(None)]).requires(&["audio-backend"]),
+                GridRow::named("mpd").cells(vec![GridCell::open(None)]).tags(&["audio-backend"]),
+            ],
+        );
+        let rows = focusables(&form);
+        let mut focus = 0; // the first cell, nowhere near Submit
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Char(CTRL_S)), Action::Ignored);
+        assert_eq!(focus, 0, "refused, and the cursor did not move: the objections are pinned anyway");
+
+        let Item::Grid { rows: grid, .. } = &mut form.items[0] else { panic!("a grid") };
+        grid[1].cells[0].checked = true;
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Char(CTRL_S)), Action::Submit);
+
+        // And in a text field it submits rather than typing a control character into the answer.
+        let mut form = Form::new().text("Name", "");
+        let rows = focusables(&form);
+        let mut focus = 0;
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Char(CTRL_S)), Action::Submit);
+        assert_eq!(form.text_value("Name"), Some(""), "nothing was typed");
+    }
+
+    /// Tab folds the section the cursor is IN — from a cell deep inside it, not only from its
+    /// title — and lands on its `>`; Tab again from there unfolds it and lands on the first entry
+    /// inside. Outside any section, or on a form that does not fold, it does nothing at all, and in
+    /// particular no longer moves down.
+    #[test]
+    fn tab_folds_the_current_block_and_unfolds_it_again() {
+        let mut form = Form::new().collapsible().grid(
+            "",
+            &["apt"],
+            vec![
+                GridRow::named("a1").heading("one").cells(vec![GridCell::open(None)]),
+                GridRow::named("a2").cells(vec![GridCell::open(None)]),
+                GridRow::named("b1").heading("two").cells(vec![GridCell::open(None)]),
+            ],
+        );
+        let rows = focusables(&form);
+        let mut focus = rows.iter().position(|row| *row == Focus::Cell { item: 0, row: 1, column: 0 }).unwrap();
+
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Tab), Action::Redraw);
+        assert!(form.collapsed.contains(&(0, 0)), "`one` is shut from inside it");
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Section { item: 0, slot: 0, foot: false }, "resting on its head");
+
+        assert_eq!(apply(&mut form, &rows, &mut focus, Key::Tab), Action::Redraw);
+        assert!(!form.collapsed.contains(&(0, 0)), "and open again from the `>`");
+        let rows = focusables(&form);
+        assert_eq!(rows[focus], Focus::Cell { item: 0, row: 0, column: 0 }, "landing on the first entry");
+
+        // Nothing to fold from the button.
+        let submit = rows.iter().position(|row| *row == Focus::Submit).unwrap();
+        let mut at_submit = submit;
+        assert_eq!(apply(&mut form, &rows, &mut at_submit, Key::Tab), Action::Ignored);
+        assert_eq!(at_submit, submit, "and the cursor stays: Tab is not ↓ any more");
+
+        // Nor on a form that does not fold — where it used to be ↓, and is now nothing.
+        let mut plain = Form::new().checkboxes("Tops", &["a", "b"]);
+        let rows = focusables(&plain);
+        let mut focus = 0;
+        assert_eq!(apply(&mut plain, &rows, &mut focus, Key::Tab), Action::Ignored);
+        assert_eq!(focus, 0);
+    }
+
+    /// The legend promises only what the form answers to: the fold key appears on a folding form
+    /// and nowhere else. Ctrl+S is always there, because Submit always is.
+    #[test]
+    fn the_legend_offers_tab_only_where_there_is_something_to_fold() {
+        let last = |form: &Form| drawn(form).last().cloned().unwrap_or_default();
+        let plain = Form::new().checkboxes("Tops", &["a"]);
+        assert!(last(&plain).contains("ctrl+s submit") && !last(&plain).contains("tab fold/unfold"));
+        let folding = Form::new().collapsible().checkboxes("Tops", &["a"]);
+        assert!(last(&folding).contains("ctrl+s submit · tab fold/unfold"), "{}", last(&folding));
+    }
+
+    /// Where the column names go in a folding grid: under every open title, and NOT at the top —
+    /// a header there would head nothing but the first title. All shut, no names at all; open one,
+    /// its copy appears. The one exception is loose rows before the first title, which have no
+    /// copy to read from and so keep the top header.
+    #[test]
+    fn a_folding_grid_heads_each_open_block_instead_of_the_whole() {
+        let names = |form: &Form| {
+            drawn(form).into_iter().filter(|line| line.trim() == "apt  flatpak").count()
+        };
+        let cell = || vec![GridCell::open(None), GridCell::open(None)];
+        let titled = || {
+            vec![
+                GridRow::named("a").heading("one").cells(cell()),
+                GridRow::named("b").heading("two").cells(cell()),
+            ]
+        };
+        let all_shut = Form::new().collapsible().grid("", &["apt", "flatpak"], titled()).all_folded();
+        assert_eq!(names(&all_shut), 0, "nothing open, so nothing to head");
+        let one_open = Form::new().collapsible().grid("", &["apt", "flatpak"], titled()).folded(0, 1);
+        assert_eq!(names(&one_open), 1, "the open block's copy, and no header above it");
+        let both_open = Form::new().collapsible().grid("", &["apt", "flatpak"], titled());
+        assert_eq!(names(&both_open), 2);
+
+        // Loose rows first: they have no title to carry a copy, so the top header stays for them.
+        let loose = Form::new().collapsible().grid(
+            "",
+            &["apt", "flatpak"],
+            vec![GridRow::named("loose").cells(cell()), GridRow::named("a").heading("one").cells(cell())],
+        );
+        let lines = drawn(&loose);
+        assert_eq!(lines[0].trim(), "apt  flatpak", "the top header, for the loose row: {lines:#?}");
+        assert_eq!(names(&loose), 2, "…plus the open block's copy");
+
+        // And a grid that does not fold is exactly as it always was: one header, no copies.
+        let plain = Form::new().grid("", &["apt", "flatpak"], titled());
+        assert_eq!(names(&plain), 1);
+    }
+
+    // ——— the block glyph: the machine's ticks against the user's ————————————
+
+    /// Three ticks, three glyphs: a box that arrived ticked is `[█]`, a box the user ticks is
+    /// `[x]`, and a suggestion is `[x]` too — told apart by colour, since it asserts nothing.
+    /// Clearing a fact reddens the empty box; ticking it again brings the block back, not an `x`,
+    /// because "as it was when we started" is true again.
+    #[test]
+    fn a_box_that_arrived_ticked_is_a_block_and_stays_one_when_re_ticked() {
+        let mut form = Form::new().checkboxes("packages", &["installed", "wanted", "recommended"]);
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
+        options[2].checked = true;
+        options[2].suggested = true;
+        let opened = Opened::of(&form);
+        let rows = focusables(&form);
+        let row = |form: &Form, want: &str| {
+            render(form, &rows, rows.len() - 1, 80, &[], &opened)
+                .into_iter()
+                .find(|line| console::strip_ansi_codes(line).contains(want))
+                .expect("drawn")
+        };
+
+        assert_eq!(row(&form, "installed"), "  [█] installed", "a fact: the block");
+        assert_eq!(row(&form, "wanted"), "  [ ] wanted");
+        assert_eq!(
+            row(&form, "recommended"),
+            format!("  {}", console::style("[x] recommended").color256(SUGGESTED_BLUE)),
+            "a suggestion keeps the x — its colour is what tells it apart"
+        );
+
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[1].checked = true;
+        options[0].checked = false;
+        assert_eq!(row(&form, "wanted"), "  [x] wanted", "the user's own tick is an x");
+        assert_eq!(
+            row(&form, "installed"),
+            console::style("  [ ] installed").red().to_string(),
+            "a fact undone"
+        );
+
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
+        assert_eq!(row(&form, "installed"), "  [█] installed", "re-ticked: the block, not an x");
+
+        // Grids say it the same way, cell by cell.
+        let grid = Form::new().grid(
+            "",
+            &["apt", "flatpak"],
+            vec![GridRow::named("brave").cells(vec![GridCell::set(None), GridCell::open(None).suggest()])],
+        );
+        let rows = focusables(&grid);
+        let line = render(&grid, &rows, 0, 80, &[], &Opened::of(&grid))
+            .into_iter()
+            .map(|line| console::strip_ansi_codes(&line).into_owned())
+            .find(|line| line.contains("brave"))
+            .expect("drawn");
+        assert!(line.contains("[█]") && line.contains("[x]"), "a fact and a suggestion: {line:?}");
     }
 }

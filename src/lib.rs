@@ -178,7 +178,9 @@ impl Choice {
         }
     }
 
-    /// Arrives ticked, as a FACT about the machine. Clearing it is a deviation, and marked red.
+    /// Arrives ticked, as a FACT about the machine — drawn `[█]` rather than `[x]`, so the form's
+    /// facts and the user's own ticks are told apart at a glance. Clearing it is a deviation, and
+    /// marked red; ticking it again brings the `[█]` back.
     #[must_use]
     pub fn ticked(mut self) -> Self {
         self.checked = true;
@@ -349,7 +351,8 @@ impl GridCell {
         Self { checked: false, enabled: true, boxed: true, on_set, on_clear: None, suggested: false }
     }
 
-    /// A cell that arrives ticked, and would do `on_clear` if emptied.
+    /// A cell that arrives ticked, and would do `on_clear` if emptied. Drawn `[█]`, the glyph of a
+    /// fact about the machine, where a tick the user adds is `[x]`.
     #[must_use]
     pub fn set(on_clear: Option<String>) -> Self {
         Self { checked: true, enabled: true, boxed: true, on_set: None, on_clear, suggested: false }
@@ -867,6 +870,33 @@ impl Form {
     pub fn folded(mut self, index: usize, slot: usize) -> Self {
         self.collapsed.insert((index, slot));
         self
+    }
+
+    /// Open with EVERY section shut — for the long forms, where a screen of section titles is
+    /// the overview and each opens on demand. No effect unless [`Form::collapsible`] is also set,
+    /// and it must come after the items it folds, since it folds what is there.
+    pub fn all_folded(mut self) -> Self {
+        for index in 0..self.items.len() {
+            for slot in 0..self.slots(index) {
+                if self.heading_at(index, slot).is_some() {
+                    self.collapsed.insert((index, slot));
+                }
+            }
+        }
+        self
+    }
+
+    /// How many entries `rule` governs — the number a filter box shows beside its label.
+    ///
+    /// Counted over EVERY entry, whatever other boxes or folds currently hide. The number is a
+    /// fact about the rule, and one that changed as other boxes were cleared would read as the
+    /// rule itself changing.
+    #[must_use]
+    pub fn governed(&self, rule: &Rule) -> usize {
+        (0..self.items.len())
+            .flat_map(|index| (0..self.slots(index)).map(move |slot| (index, slot)))
+            .filter(|(index, slot)| rule.matches(self.tags_at(*index, *slot)))
+            .count()
     }
 
     /// The heading standing above slot `slot` of item `index`, if there is one.
@@ -1461,5 +1491,46 @@ mod tests {
 
         // No rules at all is the common case and must not cost a tag lookup per row.
         assert_eq!(table(&[("i3", &["x11-only"], &[], false)]).incompatible_at(0, 0), None);
+    }
+
+    /// Opening shut is a whole-form choice, taken after the items exist: every heading slot and
+    /// only those, and nothing at all if asked before there is anything to fold.
+    #[test]
+    fn all_folded_shuts_every_section_that_exists_when_it_is_asked() {
+        let rows = || {
+            vec![
+                GridRow::named("a").heading("one").cells(vec![GridCell::open(None)]),
+                GridRow::named("b").cells(vec![GridCell::open(None)]),
+                GridRow::named("c").heading("two").cells(vec![GridCell::open(None)]),
+            ]
+        };
+        let shut = Form::new().collapsible().grid("", &["apt"], rows()).all_folded();
+        assert_eq!(shut.collapsed, [(0, 0), (0, 2)].into_iter().collect());
+        // Everything under a shut section is away, its heading slot's own row included — the fold
+        // row drawn by `_folds` stands in for it, and is not a slot.
+        assert!(shut.hidden(0, 0) && shut.hidden(0, 1), "`a` and `b` are folded under `one`");
+        assert!(shut.hidden(0, 2), "and `c` under `two`");
+
+        let early = Form::new().collapsible().all_folded().grid("", &["apt"], rows());
+        assert!(early.collapsed.is_empty(), "asked before the grid existed: nothing to fold");
+    }
+
+    /// The count beside a filter box is a fact about the rule, not about the screen: it counts
+    /// every entry the rule matches, whatever other boxes or folds are hiding.
+    #[test]
+    fn a_rule_governs_the_same_count_however_much_is_hidden() {
+        let mut form = table(&[
+            ("rg", &["terminal"], &[], false),
+            ("mpv", &["gui"], &[], false),
+            ("cmus", &["terminal"], &[], false),
+        ]);
+        let terminal_only = Rule::of("terminal-only", &["terminal", "!gui"]);
+        assert_eq!(form.governed(&terminal_only), 2);
+        assert_eq!(form.governed(&Rule::of("spyware", &["spyware"])), 0, "governing nothing is a count too");
+
+        form.filters = vec![terminal_only.clone()];
+        form.excluded.insert("terminal-only".into());
+        assert!(form.filtered_out(0, 0), "rg is hidden by the cleared box");
+        assert_eq!(form.governed(&terminal_only), 2, "and still counted: the rule did not change");
     }
 }

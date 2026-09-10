@@ -79,14 +79,28 @@ form, file, or terminal was unusable.
 
 ## Keys
 
-`↑`/`↓` (or Tab) move over the interactive rows — comments are never visited. `Space` toggles a
-checkbox or picks a radio; in a text field it types, like any other character. `Enter` confirms on
-`[ Submit ]` and otherwise hops to the next row, so fill-Enter-fill-Enter walks the form. `Esc`
+`↑`/`↓` move over the interactive rows — comments are never visited. In a grid `←`/`→` move along
+the row and `↑`/`↓` between rows, keeping the column. A section's title is a stop, `>` shut or `v`
+open: `→`, `Space` or `Tab` open a shut one and the cursor lands on its first entry (or stays on
+the title if nothing inside can be selected); `←` folds an open one. The `^` closing line is drawn
+but skipped. `Space` toggles a checkbox or picks a radio; in a text field it types, like any other
+character. `Ctrl+A` ticks every checkbox, or clears them all when they already are. `Ctrl+S`
+submits from wherever the cursor is — and does nothing while an objection stands, exactly like
+`Enter` on the dimmed button. `Tab` folds the section the cursor is in, landing on its `>`, on
+forms that fold; it is not listed on ones that do not. `Enter` confirms on `[ Submit ]` and
+otherwise hops to the next row, so fill-Enter-fill-Enter walks the form. `Esc` (or `Ctrl+C`)
 cancels.
+
+## What the boxes mean
+
+`[█]` was already so when the form opened — a fact about the machine, drawn with the cursor's own
+block so nobody mistakes it for a choice. `[x]` is a tick the user added. A `[x]` in blue is a
+suggestion: the form recommends it and asserts nothing, so declining it is an ordinary answer. A
+red `[ ]` is a fact the user cleared — a removal, meant. Ticking a fact back brings the block back.
 
 ## Design notes
 
 Two dependencies: `console` (raw keys, styling, line clearing) and `toml`. Rendering and key
-handling are pure functions (`ui::render`, `ui::apply`), tested without a terminal; `run` is the
+handling are pure functions (`ui::compose`, `ui::apply`), tested without a terminal; `run` is the
 small loop that connects them to one. Duplicate labels are rejected at definition time — answers
 are keyed by label, and two fields sharing one would silently shadow each other.

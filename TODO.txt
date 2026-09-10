@@ -1,2 +1,4 @@
 
 shortcut (key) for adding/removing extra column per line (save on vertical space)
+
+green takes precedent over red? (if a box is both, green should display)
