@@ -477,7 +477,7 @@ fn _coalesce(action: &Action, pending: bool, drained: usize) -> bool {
 ///
 /// The cursor starts and finishes immediately after the block, which is what lets the next call
 /// find it by moving up `previous` lines.
-fn _paint(term: &Term, lines: &[String], previous: usize) -> std::io::Result<()> {
+pub(crate) fn _paint(term: &Term, lines: &[String], previous: usize) -> std::io::Result<()> {
     term.write_str(&_frame(lines, previous))?;
     term.flush()
 }
@@ -612,7 +612,7 @@ fn _across_rows(rows: &[Focus], focus: usize, down: bool) -> Option<usize> {
 /// The input the form reads: stdin when it's a terminal, `/dev/tty` otherwise — the same
 /// choice `console` makes internally, so the fd we wait on and configure is the fd it reads.
 /// The `File` half keeps a non-stdin tty open for as long as the handle lives.
-fn _input_fd() -> std::io::Result<(std::os::fd::RawFd, Option<std::fs::File>)> {
+pub(crate) fn _input_fd() -> std::io::Result<(std::os::fd::RawFd, Option<std::fs::File>)> {
     use std::io::IsTerminal;
     use std::os::fd::AsRawFd;
     let stdin = std::io::stdin();
@@ -633,13 +633,13 @@ fn _input_fd() -> std::io::Result<(std::os::fd::RawFd, Option<std::fs::File>)> {
 /// ptys masked it, because their input arrives pre-buffered with newlines in it.) Holding raw
 /// for the run's lifetime gives byte-at-a-time reads with no echo; the output flags keep their
 /// original state so `\n` still starts a fresh line.
-struct RawMode {
+pub(crate) struct RawMode {
     fd: std::os::fd::RawFd,
     original: libc::termios,
 }
 
 impl RawMode {
-    fn engage(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
+    pub(crate) fn engage(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
         // SAFETY: tcgetattr/tcsetattr write only the termios handed to them; the fd is the
         // terminal this form runs on.
         unsafe {
@@ -676,7 +676,7 @@ impl Drop for RawMode {
 /// whether an idle form costs 0% CPU should not depend on a dependency's key-reading internals.
 /// It only works because [`RawMode`] holds the terminal non-canonical: cooked mode releases
 /// bytes to `poll` a full line at a time.
-fn _await_input(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
+pub(crate) fn _await_input(fd: std::os::fd::RawFd) -> std::io::Result<bool> {
     let mut watch = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
     loop {
         // SAFETY: `poll` reads and writes only the pollfd handed to it, which lives on this
@@ -1267,12 +1267,27 @@ const FOLD_FOOT_VIOLET: u8 = 97;
 /// the only one that is a recommendation rather than a report.
 const SUGGESTED_BLUE: u8 = 39;
 
-/// A box ticked by the MACHINE — installed already, or otherwise so when the form opened. The
-/// block is the cursor's own glyph, and the point is that it is not an `x`: nobody put it there,
-/// so a reader can tell the form's facts from their own choices at a glance. Clearing it undoes a
-/// fact and is marked red; ticking it again brings the block back rather than an `x`, because what
-/// the block says is "as it was when we started", and that is true again.
-const GIVEN: &str = "[█]";
+/// A box ticked by the MACHINE — installed already, or otherwise so when the form opened. A filled
+/// square, and the point is that it is not an `x`: nobody put it there, so a reader can tell the
+/// form's facts from their own choices at a glance. Clearing it undoes a fact and is marked red;
+/// ticking it again brings the square back rather than an `x`, because what the square says is
+/// "as it was when we started", and that is true again.
+///
+/// The glyph took four tries, and the reasons are worth keeping. The full block `█` IS the
+/// cursor's glyph, and under the reverse-video focus it inverted into a solid dark cell — the one
+/// box that most needed to read as ticked looked like a hole. The vertical rectangle `▮` stood the
+/// brackets' full height and read as a bar, not a mark. The medium square `◼` LOOKED best — most
+/// fonts draw it a little smaller and centred higher, between the brackets' ends — and lost anyway,
+/// on safety: Unicode lists it as emoji-capable, and a terminal that forces an emoji font on it
+/// draws it two cells wide and breaks every column. `■` has no emoji property at all, so it is one
+/// cell in every terminal that agrees with itself about width. It sits low in most monospace fonts,
+/// level with the brackets' feet, and that is the price of the guarantee.
+///
+/// Where a glyph falls is the font's decision, not Unicode's: `printf '[■] [◼] [▪]\n'` in the
+/// terminal the form will be read in is the whole test, should the trade ever be revisited. Width
+/// is ambiguous — one cell outside CJK locales, like the `▸` cursor marker — and the test below
+/// holds it at one.
+const GIVEN: &str = "[■]";
 /// A box the user ticked — or one the form suggested, which is a tick that asserts nothing and is
 /// told apart by its colour rather than its glyph.
 const TICKED: &str = "[x]";
@@ -1723,7 +1738,7 @@ mod tests {
         };
 
         // Focus parks on Submit throughout, so nothing here is the focus highlight's doing.
-        assert_eq!(row(&form, "on"), "  [█] on", "unchanged, unmarked");
+        assert_eq!(row(&form, "on"), "  [■] on", "unchanged, unmarked");
         assert_eq!(row(&form, "off"), "  [ ] off");
 
         // Clear the one that arrived ticked.
@@ -1739,7 +1754,7 @@ mod tests {
         // Put it back: the mark comes off as cleanly as it went on.
         let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
         options[0].checked = true;
-        assert_eq!(row(&form, "on"), "  [█] on");
+        assert_eq!(row(&form, "on"), "  [■] on");
     }
 
     /// Three managers, three packages, one unavailable everywhere but the middle — the shape the
@@ -1797,7 +1812,7 @@ mod tests {
         let lines = drawn(&sectioned().collapsible());
         let at = |want: &str| lines.iter().position(|line| line.trim() == want);
         assert_eq!(
-            (at("v dev"), at("[ ] git"), at("[█] jq"), at("^ dev")),
+            (at("v dev"), at("[ ] git"), at("[■] jq"), at("^ dev")),
             (Some(1), Some(2), Some(3), Some(4)),
             "{lines:#?}"
         );
@@ -2043,7 +2058,7 @@ mod tests {
             vec![GridRow::named("git").cells(vec![GridCell::set(None), GridCell::set(None), GridCell::set(None)])],
         );
         // ["packages:", "apt", the row, …] — the label line, then the headings, then the boxes.
-        assert_eq!(drawn(&form)[2], "[█]  git", "one column drawn, the surplus dropped");
+        assert_eq!(drawn(&form)[2], "[■]  git", "one column drawn, the surplus dropped");
         assert!(form.answers_toml().contains("apt"), "and the answers agree: {}", form.answers_toml());
     }
 
@@ -2145,7 +2160,7 @@ mod tests {
             lines.iter().find(|line| console::strip_ansi_codes(line).contains(want)).expect("drawn")
         };
 
-        assert_eq!(row("installed"), "  [█] installed", "already so — no colour");
+        assert_eq!(row("installed"), "  [■] installed", "already so — no colour");
         assert_eq!(
             row("recommended"),
             &format!("  {}", console::style("[x] recommended").color256(SUGGESTED_BLUE)),
@@ -2185,7 +2200,7 @@ mod tests {
         let boxed = |mark: &str| format!("{}  {mark}", console::style("[x]").color256(SUGGESTED_BLUE));
 
         assert_eq!(row_of(&form, "recommended"), boxed("recommended"), "suggested — blue");
-        assert_eq!(row_of(&form, "installed"), "[█]  installed", "already so — plain");
+        assert_eq!(row_of(&form, "installed"), "[■]  installed", "already so — plain");
 
         // Clear both. Only the one the form ASSERTED reddens.
         let Item::Grid { rows: grid, .. } = &mut form.items[0] else { panic!() };
@@ -2621,9 +2636,9 @@ mod tests {
                 "packages:",
                 "apt  flatpak  snap",
                 "# tools",
-                "[█]   ·        ·    git      # version control",
+                "[■]   ·        ·    git      # version control",
                 "# browsers",
-                " ·   [█]      [ ]   brave",
+                " ·   [■]      [ ]   brave",
                 "[ ]  [ ]      [ ]   firefox",
             ],
             "{drawn:#?}"
@@ -2765,7 +2780,7 @@ mod tests {
         };
         assert_eq!(
             git_row(&form),
-            "[█]   ·        ·    git      # version control",
+            "[■]   ·        ·    git      # version control",
             "unchanged, unmarked"
         );
 
@@ -3080,8 +3095,8 @@ mod tests {
         let plain: Vec<String> =
             lines.iter().map(|l| console::strip_ansi_codes(l).into_owned()).collect();
         let all = plain.join("\n");
-        // `b` was ticked before the snapshot was taken, so it is a fact and draws as the block.
-        assert!(all.contains("[█] b") && all.contains("[ ] a"), "{all}");
+        // `b` was ticked before the snapshot was taken, so it is a fact and draws as the given glyph.
+        assert!(all.contains("[■] b") && all.contains("[ ] a"), "{all}");
         assert!(all.contains("(•) S") && all.contains("( ) M"), "{all}");
         assert!(all.contains("can't touch this"), "comments render, dimmed: {all}");
         assert!(all.contains("[ Submit ]"), "{all}");
@@ -3669,14 +3684,19 @@ mod tests {
         assert_eq!(names(&plain), 1);
     }
 
-    // ——— the block glyph: the machine's ticks against the user's ————————————
+    // ——— the given glyph: the machine's ticks against the user's ————————————
 
-    /// Three ticks, three glyphs: a box that arrived ticked is `[█]`, a box the user ticks is
+    /// Three ticks, three glyphs: a box that arrived ticked is `[■]`, a box the user ticks is
     /// `[x]`, and a suggestion is `[x]` too — told apart by colour, since it asserts nothing.
-    /// Clearing a fact reddens the empty box; ticking it again brings the block back, not an `x`,
+    /// Clearing a fact reddens the empty box; ticking it again brings the given glyph back, not an `x`,
     /// because "as it was when we started" is true again.
     #[test]
-    fn a_box_that_arrived_ticked_is_a_block_and_stays_one_when_re_ticked() {
+    fn a_box_that_arrived_ticked_wears_the_given_glyph_and_keeps_it_when_re_ticked() {
+        // Every glyph here is one cell wide, or the columns come apart. Pinned because the given
+        // glyph has changed twice and both earlier choices were of ambiguous width.
+        for glyph in [GIVEN, TICKED, CLEAR] {
+            assert_eq!(console::measure_text_width(glyph), 3, "{glyph:?} is not three cells");
+        }
         let mut form = Form::new().checkboxes("packages", &["installed", "wanted", "recommended"]);
         let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
         options[0].checked = true;
@@ -3691,7 +3711,7 @@ mod tests {
                 .expect("drawn")
         };
 
-        assert_eq!(row(&form, "installed"), "  [█] installed", "a fact: the block");
+        assert_eq!(row(&form, "installed"), "  [■] installed", "a fact: the given glyph");
         assert_eq!(row(&form, "wanted"), "  [ ] wanted");
         assert_eq!(
             row(&form, "recommended"),
@@ -3711,7 +3731,7 @@ mod tests {
 
         let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
         options[0].checked = true;
-        assert_eq!(row(&form, "installed"), "  [█] installed", "re-ticked: the block, not an x");
+        assert_eq!(row(&form, "installed"), "  [■] installed", "re-ticked: the given glyph, not an x");
 
         // Grids say it the same way, cell by cell.
         let grid = Form::new().grid(
@@ -3725,6 +3745,6 @@ mod tests {
             .map(|line| console::strip_ansi_codes(&line).into_owned())
             .find(|line| line.contains("brave"))
             .expect("drawn");
-        assert!(line.contains("[█]") && line.contains("[x]"), "a fact and a suggestion: {line:?}");
+        assert!(line.contains("[■]") && line.contains("[x]"), "a fact and a suggestion: {line:?}");
     }
 }

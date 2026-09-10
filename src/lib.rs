@@ -32,10 +32,12 @@
 
 mod comments;
 mod definition;
+pub mod menu;
 pub mod prompts;
 pub mod ui;
 
 pub use prompts::{prompt_Yn, prompt_yN, prompt_yn}; // capitals mirror the [Y/n]/[y/N] each prints
+pub use menu::{run_menu, Chosen, Menu, Pick};
 pub use ui::{run, run_with_warnings, Outcome};
 
 /// One entry of a form, in display order.
@@ -178,9 +180,9 @@ impl Choice {
         }
     }
 
-    /// Arrives ticked, as a FACT about the machine — drawn `[█]` rather than `[x]`, so the form's
+    /// Arrives ticked, as a FACT about the machine — drawn `[■]` rather than `[x]`, so the form's
     /// facts and the user's own ticks are told apart at a glance. Clearing it is a deviation, and
-    /// marked red; ticking it again brings the `[█]` back.
+    /// marked red; ticking it again brings the `[■]` back.
     #[must_use]
     pub fn ticked(mut self) -> Self {
         self.checked = true;
@@ -351,7 +353,7 @@ impl GridCell {
         Self { checked: false, enabled: true, boxed: true, on_set, on_clear: None, suggested: false }
     }
 
-    /// A cell that arrives ticked, and would do `on_clear` if emptied. Drawn `[█]`, the glyph of a
+    /// A cell that arrives ticked, and would do `on_clear` if emptied. Drawn `[■]`, the glyph of a
     /// fact about the machine, where a tick the user adds is `[x]`.
     #[must_use]
     pub fn set(on_clear: Option<String>) -> Self {

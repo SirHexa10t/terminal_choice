@@ -77,6 +77,24 @@ Text fields and checkbox groups always appear (an empty array means "asked, none
 nobody picked is omitted. Exit codes: `0` submitted, `1` cancelled (nothing printed), `2` the
 form, file, or terminal was unusable.
 
+## The menu
+
+The simplest thing here, for the question "which of these?": a numbered list and a number typed in
+answer. No cursor — digits accumulate, `Enter` picks, `Esc` cancels, `Backspace` edits. An option
+can be *locked*: shown dimmed with the reason, and refused with it if its number is typed, which is
+how a menu says what will be on offer without pretending it already is.
+
+```rust
+let mut menu = Menu::new("Which do you want to rice?")
+    .intro("Detected: Linux Mint 22, Wayland session.")
+    .pick("Linux packages")
+    .locked("Smartphone", "adb is not wired up yet");
+match run_menu(&mut menu)? {
+    Chosen::Picked(0) => { /* packages */ }
+    Chosen::Picked(_) | Chosen::Cancelled => {}
+}
+```
+
 ## Keys
 
 `↑`/`↓` move over the interactive rows — comments are never visited. In a grid `←`/`→` move along
@@ -93,10 +111,10 @@ cancels.
 
 ## What the boxes mean
 
-`[█]` was already so when the form opened — a fact about the machine, drawn with the cursor's own
-block so nobody mistakes it for a choice. `[x]` is a tick the user added. A `[x]` in blue is a
+`[■]` was already so when the form opened — a fact about the machine, drawn as a filled square so nobody
+mistakes it for a choice. `[x]` is a tick the user added. A `[x]` in blue is a
 suggestion: the form recommends it and asserts nothing, so declining it is an ordinary answer. A
-red `[ ]` is a fact the user cleared — a removal, meant. Ticking a fact back brings the block back.
+red `[ ]` is a fact the user cleared — a removal, meant. Ticking a fact back brings the square back.
 
 ## Design notes
 
