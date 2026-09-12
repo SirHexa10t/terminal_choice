@@ -12,7 +12,7 @@
 
 use console::{Key, Term};
 
-use crate::ui::{_await_input, _input_fd, _paint, RawMode};
+use crate::ui::{_await_input, _input_fd, _paint, _style, RawMode};
 
 /// One line of a menu.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,7 +111,7 @@ pub(crate) fn render(menu: &Menu, width: usize) -> Vec<String> {
         let number = format!("{:>digits$})", at + 1);
         lines.push(match &pick.locked {
             // Dim, like a disabled box: shown so the reader knows it exists, and quiet about it.
-            Some(why) => console::style(format!("  {number} {}  — not yet: {why}", pick.label)).dim().to_string(),
+            Some(why) => _style(format!("  {number} {}  — not yet: {why}", pick.label)).dim().to_string(),
             None => format!("  {number} {}", pick.label),
         });
     }
@@ -119,9 +119,9 @@ pub(crate) fn render(menu: &Menu, width: usize) -> Vec<String> {
     // as "type here". Nothing is inverted: there is no cursor to mark, only a place to type.
     lines.push(format!("> {}▏", menu.typed));
     if let Some(why) = &menu.refused {
-        lines.push(console::style(format!("  ✗ {why}")).red().bold().to_string());
+        lines.push(_style(format!("  ✗ {why}")).red().bold().to_string());
     }
-    lines.push(console::style("type a number · enter picks · esc cancels").dim().to_string());
+    lines.push(_style("type a number · enter picks · esc cancels").dim().to_string());
     lines.into_iter().map(|line| console::truncate_str(&line, width, "…").into_owned()).collect()
 }
 
@@ -242,7 +242,7 @@ mod tests {
         let lines = render(&menu(), 120);
         assert_eq!(
             lines[3],
-            console::style("  2) configs  — not yet: a config owns a file, and files are not modelled").dim().to_string()
+            _style("  2) configs  — not yet: a config owns a file, and files are not modelled").dim().to_string()
         );
         assert_eq!(lines[2], "  1) packages");
     }

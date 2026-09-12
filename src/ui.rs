@@ -459,6 +459,30 @@ fn _coalesce(action: &Action, pending: bool, drained: usize) -> bool {
     matches!(action, Action::Redraw) && pending && drained < COALESCE
 }
 
+/// Style `val` for the stream the form actually draws on.
+///
+/// USE THIS RATHER THAN `console::style`, everywhere, including in tests that build an expected
+/// line — the two must agree or the comparison is between differently-gated strings.
+///
+/// `console` emits an escape only when it believes the destination is a terminal, and the stream
+/// a bare style asks about is STDOUT. This form draws on stderr precisely so that stdout stays
+/// free for the answers — which means that under the composition the README documents,
+/// `terminal_choice … > answers.toml`, a default-built style consults the redirected file,
+/// concludes there is no terminal, and emits nothing at all.
+///
+/// It is not only colour. `console` writes attributes inside the same gate as foreground and
+/// background, so the bold title and every dimmed line go with them. What survives is the focus
+/// bar, because that one is assembled from raw `\x1b[7m` by hand and never passes through
+/// `console` — so the form does not degrade to a clean no-colour mode, it keeps exactly one cue
+/// and loses the rest, which reads as broken rather than as colour-disabled.
+///
+/// Invisible to `cargo test`: under a test harness NEITHER stream is a terminal, so both gates
+/// answer false and the two spellings are indistinguishable. Only a real redirect tells them
+/// apart, which is why the test below drives the gates directly.
+pub(crate) fn _style<D>(val: D) -> console::StyledObject<D> {
+    console::style(val).for_stderr()
+}
+
 /// Paint `lines` over the frame already on screen, which was `previous` lines tall.
 ///
 /// One write, and no blank state in between. Both matter, and for different reasons.
@@ -748,14 +772,14 @@ pub(crate) fn compose(
     let unmet = form.unmet();
     let mut lines = Vec::new();
     if let Some(title) = &form.title {
-        lines.push(console::style(title).bold().to_string());
+        lines.push(_style(title).bold().to_string());
         lines.push(String::new());
     }
     // The filter block, above everything it governs. Drawn here rather than as an `Item` on
     // purpose: it is not an answer, and an item would put it in `answers_toml` alongside the
     // things the user was actually asked.
     if form.filter_boxes().next().is_some() {
-        let violet = |text: String| console::style(text).color256(FILTER_VIOLET).to_string();
+        let violet = |text: String| _style(text).color256(FILTER_VIOLET).to_string();
         if !form.filter_label.is_empty() {
             lines.push(violet(format!("{}:", form.filter_label)));
         }
@@ -799,7 +823,7 @@ pub(crate) fn compose(
             Item::Comment(text) => {
                 for comment_line in text.lines() {
                     lines.push(
-                        console::style(format!("{comment_indent}{}", clean(comment_line.to_string())))
+                        _style(format!("{comment_indent}{}", clean(comment_line.to_string())))
                             .dim()
                             .to_string(),
                     );
@@ -834,18 +858,18 @@ pub(crate) fn compose(
                         hinted,
                         form.wanted_among(&unmet, index, option),
                     ) {
-                        (true, _, _) => console::style(row).red().to_string(),
-                        (_, true, _) => console::style(row).color256(SUGGESTED_BLUE).to_string(),
+                        (true, _, _) => _style(row).red().to_string(),
+                        (_, true, _) => _style(row).color256(SUGGESTED_BLUE).to_string(),
                         // Green last of the three: red and blue are about THIS entry's own tick,
                         // and green is about a hole somewhere else that this entry could fill.
                         // An entry that is both is better described by its own state.
-                        (_, _, true) => console::style(row).color256(WANTED_GREEN).to_string(),
+                        (_, _, true) => _style(row).color256(WANTED_GREEN).to_string(),
                         _ => row,
                     };
                     lines.push(match entry.enabled && form.incompatible_at(index, option).is_none() {
                         // Dim, and never marked: the focus list has no row for it, so `mark`
                         // could not report it focused anyway — this only says so visibly.
-                        false => console::style(format!("  {row}")).dim().to_string(),
+                        false => _style(format!("  {row}")).dim().to_string(),
                         true => mark(row, Focus::Option { item: index, option }),
                     });
                     lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
@@ -867,11 +891,11 @@ pub(crate) fn compose(
                     let dot = if *chosen == Some(option) { "(•)" } else { "( )" };
                     let row = format!("{dot} {}", clean(entry.name.clone()));
                     let row = match form.wanted_among(&unmet, index, option) {
-                        true => console::style(row).color256(WANTED_GREEN).to_string(),
+                        true => _style(row).color256(WANTED_GREEN).to_string(),
                         false => row,
                     };
                     lines.push(match entry.enabled && form.incompatible_at(index, option).is_none() {
-                        false => console::style(format!("  {row}")).dim().to_string(),
+                        false => _style(format!("  {row}")).dim().to_string(),
                         true => mark(row, Focus::Option { item: index, option }),
                     });
                     lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
@@ -928,7 +952,7 @@ pub(crate) fn compose(
                     .zip(&slots)
                     .map(|(column, slot)| format!("{column}{}", pad(column, *slot)))
                     .collect();
-                let header = console::style(format!("{lead}{heads}")).dim().to_string();
+                let header = _style(format!("{lead}{heads}")).dim().to_string();
                 // A folding grid repeats the header under every open title (below), so its own
                 // copy at the top would head nothing but the first title — dropped, unless loose
                 // rows come before that title and have no copy to read from. A grid that does not
@@ -987,21 +1011,21 @@ pub(crate) fn compose(
                             // towards the width and the columns stay straight.
                             let inked = match (cell.boxed, cell.enabled && !greyed) {
                                 // Nothing this column could ever do for this row.
-                                (false, _) => console::style(" · ").dim().to_string(),
+                                (false, _) => _style(" · ").dim().to_string(),
                                 // A choice that exists but is out of reach — shown as the box it
                                 // is, so a reader can see what setting something up would unlock,
                                 // and dark enough that nobody mistakes it for one they can pick.
                                 (true, false) => {
-                                    console::style(drawn).color256(LOCKED_GREY).to_string()
+                                    _style(drawn).color256(LOCKED_GREY).to_string()
                                 }
                                 (true, true) => {
                                     match (
                                         opened.cleared(index, row, column, cell.checked),
                                         cell.checked && cell.suggested,
                                     ) {
-                                        (true, _) => console::style(drawn).red().to_string(),
+                                        (true, _) => _style(drawn).red().to_string(),
                                         (_, true) => {
-                                            console::style(drawn).color256(SUGGESTED_BLUE).to_string()
+                                            _style(drawn).color256(SUGGESTED_BLUE).to_string()
                                         }
                                         _ => drawn.to_string(),
                                     }
@@ -1017,15 +1041,15 @@ pub(crate) fn compose(
                     let named = clean(entry.label.clone());
                     let plain = named.clone();
                     let named = match (greyed, form.wanted_among(&unmet, index, row)) {
-                        (true, _) => console::style(named).dim().to_string(),
-                        (_, true) => console::style(named).color256(WANTED_GREEN).to_string(),
+                        (true, _) => _style(named).dim().to_string(),
+                        (_, true) => _style(named).color256(WANTED_GREEN).to_string(),
                         _ => named,
                     };
                     let note = entry.note.as_ref().map_or(String::new(), |note| {
                         // Measured against the UNSTYLED label: an escape sequence has no width
                         // on screen, and counting one would push every note after it out of line.
                         let gap = pad(&plain, widest);
-                        console::style(format!("{gap}  # {}", clean(note.clone()))).dim().to_string()
+                        _style(format!("{gap}  # {}", clean(note.clone()))).dim().to_string()
                     });
                     lines.push(format!("{lead}{boxes}{named}{note}"));
                     lines.extend(_fold_lines(form, index, row, true, rows, focus, &clean));
@@ -1041,7 +1065,7 @@ pub(crate) fn compose(
     let objections = form.objections();
     lines.push(match objections.is_empty() {
         true => mark("[ Submit ]".to_string(), Focus::Submit),
-        false => mark(console::style("[ Submit ]").dim().to_string(), Focus::Submit),
+        false => mark(_style("[ Submit ]").dim().to_string(), Focus::Submit),
     });
     // What the cell under the cursor would do, if it says. Above the cautions because it is
     // about the one thing being looked at, while they are about the whole answer.
@@ -1060,7 +1084,7 @@ pub(crate) fn compose(
         for (line, text) in _wrap(&clean(objection.clone()), width.saturating_sub(4)).iter().enumerate()
         {
             let lead = if line == 0 { "  \u{2717} " } else { "    " };
-            lines.push(console::style(format!("{lead}{text}")).red().bold().to_string());
+            lines.push(_style(format!("{lead}{text}")).red().bold().to_string());
         }
     }
     for warning in warnings {
@@ -1068,14 +1092,14 @@ pub(crate) fn compose(
         {
             // Continuations hang under the first line's text, not under its marker.
             let lead = if line == 0 { "  ⚠ " } else { "    " };
-            lines.push(console::style(format!("{lead}{text}")).red().to_string());
+            lines.push(_style(format!("{lead}{text}")).red().to_string());
         }
     }
     // Only the keys this form answers to: a fold key on a form with nothing to fold would be a
     // promise the form cannot keep.
     let fold = if form.collapsible { " · tab fold/unfold" } else { "" };
     lines.push(
-        console::style(format!(
+        _style(format!(
             "↑/↓/←/→ move · space picks · ctrl+a all/none · ctrl+s submit{fold} · enter next/submit · esc cancels"
         ))
         .dim()
@@ -1193,7 +1217,7 @@ fn _fold_lines(
             // control, and a reader learns it once. The FOOT takes a darker shade of it: a `^`
             // in the same violet as the `v` beneath it read as the next section beginning.
             let shade = if foot { FOLD_FOOT_VIOLET } else { FILTER_VIOLET };
-            let text = console::style(format!("{lead}{said}")).color256(shade).to_string();
+            let text = _style(format!("{lead}{said}")).color256(shade).to_string();
             match rows.get(focus) == Some(&here) && line == 0 {
                 true => format!("{FOCUS_ON}▸ {}\x1b[0m", text.replace("\x1b[0m", "\x1b[0m\x1b[7m")),
                 false => format!("  {text}"),
@@ -1214,7 +1238,7 @@ fn subtitle(
         return Vec::new();
     };
     said.lines()
-        .map(|line| console::style(format!("{indent}{}", clean(line.to_string()))).dim().to_string())
+        .map(|line| _style(format!("{indent}{}", clean(line.to_string()))).dim().to_string())
         .collect()
 }
 
@@ -1567,7 +1591,7 @@ mod tests {
         // enabled here. Under NO_COLOR (or a pipe) the marker still carries the meaning alone.
         assert_eq!(
             loud[first],
-            console::style("  \u{26a0} Two VPN clients at once is unusual,").red().to_string(),
+            _style("  \u{26a0} Two VPN clients at once is unusual,").red().to_string(),
             "the warning line is the red-styled first wrap"
         );
 
@@ -1715,7 +1739,7 @@ mod tests {
         );
         // The locked row is styled like a comment, not like a focusable one.
         let locked = drawn.iter().find(|l| l.contains("apt")).expect("drawn");
-        assert_eq!(locked, &console::style("  [ ] apt").dim().to_string());
+        assert_eq!(locked, &_style("  [ ] apt").dim().to_string());
     }
 
     /// A box the form opened with, and the user has since cleared, is drawn red — clearing a tick
@@ -1744,7 +1768,7 @@ mod tests {
         // Clear the one that arrived ticked.
         let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
         options[0].checked = false;
-        assert_eq!(row(&form, "on"), console::style("  [ ] on").red().to_string());
+        assert_eq!(row(&form, "on"), _style("  [ ] on").red().to_string());
 
         // Tick the one that arrived clear: a plain answer, not a reversal.
         let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
@@ -2139,7 +2163,7 @@ mod tests {
 
         assert_eq!(
             row(&form, "installed"),
-            console::style("  [ ] installed").red().to_string(),
+            _style("  [ ] installed").red().to_string(),
             "a fact undone is worth seeing"
         );
         assert_eq!(
@@ -2163,7 +2187,7 @@ mod tests {
         assert_eq!(row("installed"), "  [■] installed", "already so — no colour");
         assert_eq!(
             row("recommended"),
-            &format!("  {}", console::style("[x] recommended").color256(SUGGESTED_BLUE)),
+            &format!("  {}", _style("[x] recommended").color256(SUGGESTED_BLUE)),
             "recommended — blue"
         );
         assert_eq!(row("neither"), "  [ ] neither");
@@ -2197,7 +2221,7 @@ mod tests {
                 .find(|line| console::strip_ansi_codes(line).contains(want))
                 .expect("drawn")
         };
-        let boxed = |mark: &str| format!("{}  {mark}", console::style("[x]").color256(SUGGESTED_BLUE));
+        let boxed = |mark: &str| format!("{}  {mark}", _style("[x]").color256(SUGGESTED_BLUE));
 
         assert_eq!(row_of(&form, "recommended"), boxed("recommended"), "suggested — blue");
         assert_eq!(row_of(&form, "installed"), "[■]  installed", "already so — plain");
@@ -2208,7 +2232,7 @@ mod tests {
         grid[1].cells[0].checked = false;
         assert_eq!(
             row_of(&form, "installed"),
-            format!("{}  installed", console::style("[ ]").red()),
+            format!("{}  installed", _style("[ ]").red()),
             "a fact undone"
         );
         assert_eq!(row_of(&form, "recommended"), "[ ]  recommended", "a suggestion declined");
@@ -2234,7 +2258,7 @@ mod tests {
         apply(&mut form, &rows, &mut focus, Key::Char(' '));
         assert_eq!(
             line(&form),
-            format!("  {}", console::style("[x] recommended").color256(SUGGESTED_BLUE)),
+            format!("  {}", _style("[x] recommended").color256(SUGGESTED_BLUE)),
             "on again, and blue again"
         );
     }
@@ -2298,7 +2322,7 @@ mod tests {
         // `style` emits nothing when stdout is not a terminal — which under `cargo test` it never
         // is. Comparing styled against styled holds either way, and checks the real thing when a
         // run does have colour.
-        let violet = |text: &str| console::style(text).color256(FILTER_VIOLET).to_string();
+        let violet = |text: &str| _style(text).color256(FILTER_VIOLET).to_string();
         let form = tagged();
         let rows = focusables(&form);
         let lines = render(&form, &rows, rows.len() - 1, 200, &[], &Opened::of(&form));
@@ -2790,7 +2814,7 @@ mod tests {
         // enabled here — under NO_COLOR the box is plain and the row is otherwise identical.
         assert_eq!(
             git_row(&form),
-            format!("{}   ·        ·    git      # version control", console::style("[ ]").red()),
+            format!("{}   ·        ·    git      # version control", _style("[ ]").red()),
             "a cell that arrived ticked and was cleared is marked"
         );
     }
@@ -2966,6 +2990,60 @@ mod tests {
         assert_eq!(apply(&mut no_boxes, &rows, &mut focus, Key::Home), Action::Ignored);
     }
 
+    /// `console`'s stdout colour switch, put back on the way out.
+    ///
+    /// It is a process-wide static shared by every test in this binary, so a test that sets it and
+    /// walks away has set it for everything after. Restoring on `Drop` rather than at the end of
+    /// the test keeps that true when an assertion fails.
+    struct StdoutGate(bool);
+
+    impl StdoutGate {
+        fn set(on: bool) -> Self {
+            let restore = Self(console::colors_enabled());
+            console::set_colors_enabled(on);
+            restore
+        }
+    }
+
+    impl Drop for StdoutGate {
+        fn drop(&mut self) {
+            console::set_colors_enabled(self.0);
+        }
+    }
+
+    /// The form draws on stderr, so its styling has to follow stderr — not stdout, which is the
+    /// stream `console` asks about by default and the one the README's `… > answers.toml`
+    /// redirects to a file. Getting this wrong renders the form with no styling at all under its
+    /// own documented usage, and not only no colour: attributes share that gate, so the bold title
+    /// and every dimmed line go with it.
+    ///
+    /// ONLY THE STDOUT GATE IS TOUCHED, and that is what keeps this test honest beside the others.
+    /// Both gates are process-wide and the suite runs threaded, so flipping the STDERR one would
+    /// change what every concurrently-running drawing test sees between building its frame and
+    /// building its expectation — which is a real race, observed as roughly two runs in three
+    /// failing before this was written this way. Since every style in the crate now goes through
+    /// [`_style`] and is therefore stderr-bound, nothing else reads the stdout gate at all.
+    ///
+    /// The first assertion is the whole claim, and it is phrased against whatever the stderr gate
+    /// happens to say rather than against `true`, so it holds under `CLICOLOR_FORCE=1` as well.
+    /// The second is the control: it shows a bare style really does answer to the stdout gate, so
+    /// the first is not passing for want of anything to compare.
+    #[test]
+    fn styling_follows_stderr_and_not_a_redirected_stdout() {
+        let _stdout = StdoutGate::set(true);
+
+        let ours = _style("x").bold().to_string();
+        assert_eq!(
+            ours.contains('\x1b'),
+            console::colors_enabled_stderr(),
+            "the form's styling must track the STDERR gate, and it drew {ours:?}"
+        );
+        assert!(
+            console::style("x").bold().to_string().contains('\x1b'),
+            "control: a bare style answers to the stdout gate, which is on"
+        );
+    }
+
     /// Coloured option text survives by default — including THROUGH the focus highlight, which
     /// must re-arm its reverse-video after every embedded reset instead of dying at the first
     /// one. `scrub_colors` is the opt-out.
@@ -2986,6 +3064,35 @@ mod tests {
         let lines = render(&scrubbed, &rows, 0, 200, &[], &Opened::of(&scrubbed));
         let row = lines.iter().find(|l| l.contains("firefox")).unwrap();
         assert!(!row.contains("30;41"), "scrubbed means gone: {row:?}");
+    }
+
+    /// The same guarantee as above, on the OTHER path that draws a focus bar.
+    ///
+    /// A section heading renders through [`_fold_lines`], not through the row closure the test
+    /// above exercises — and for a while that site did not re-arm, so a coloured heading's
+    /// highlight died at the first embedded reset while the option path was fully covered. The
+    /// invariant was tested only on the path that already satisfied it, which is why nothing
+    /// caught it. Both paths now, so neither can drift alone.
+    #[test]
+    fn a_coloured_section_heading_survives_focus_too() {
+        let glow = "\x1b[30;41mdev\x1b[0m tools";
+        let mut form = Form::new().checkboxes("packages", &["git", "jq"]).collapsible();
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].heading = Some(glow.into());
+
+        let rows = focusables(&form);
+        let at = rows
+            .iter()
+            .position(|row| matches!(row, Focus::Section { .. }))
+            .expect("a collapsible form has a section row");
+        let lines = render(&form, &rows, at, 200, &[], &Opened::of(&form));
+        let focused = lines.iter().find(|l| l.contains("tools")).expect("the heading is drawn");
+
+        assert!(focused.contains("\x1b[7m"), "the heading carries the focus bar: {focused:?}");
+        assert!(
+            focused.contains("\x1b[0m\x1b[7m"),
+            "every embedded reset re-arms the focus reverse: {focused:?}"
+        );
     }
 
     /// Junk input — unknown escapes, letters over checkboxes — must change nothing AND paint
@@ -3213,7 +3320,7 @@ mod tests {
         };
         assert_eq!(
             row("mpd"),
-            format!("  {}", console::style("[ ] mpd").color256(WANTED_GREEN)),
+            format!("  {}", _style("[ ] mpd").color256(WANTED_GREEN)),
             "the supplier, green"
         );
         assert_eq!(row("mpv"), "  [ ] mpv", "a bystander, plain");
@@ -3368,7 +3475,7 @@ mod tests {
         let pointing = build(false);
         assert!(pointing.wanted_at(0, 1) && !pointing.wanted_at(0, 0));
         assert!(
-            row(&pointing, "mpd").contains(&console::style("mpd").color256(WANTED_GREEN).to_string()),
+            row(&pointing, "mpd").contains(&_style("mpd").color256(WANTED_GREEN).to_string()),
             "the row that would answer it: {:?}",
             row(&pointing, "mpd")
         );
@@ -3517,7 +3624,7 @@ mod tests {
     /// every colour test here — see `the_filter_block_is_coloured_and_stays_coloured_under_the_cursor`.
     #[test]
     fn fold_titles_wear_the_filter_blocks_colour() {
-        let violet = |text: &str| console::style(text).color256(FILTER_VIOLET).to_string();
+        let violet = |text: &str| _style(text).color256(FILTER_VIOLET).to_string();
         let form = Form::new()
             .collapsible()
             .grid(
@@ -3715,7 +3822,7 @@ mod tests {
         assert_eq!(row(&form, "wanted"), "  [ ] wanted");
         assert_eq!(
             row(&form, "recommended"),
-            format!("  {}", console::style("[x] recommended").color256(SUGGESTED_BLUE)),
+            format!("  {}", _style("[x] recommended").color256(SUGGESTED_BLUE)),
             "a suggestion keeps the x — its colour is what tells it apart"
         );
 
@@ -3725,7 +3832,7 @@ mod tests {
         assert_eq!(row(&form, "wanted"), "  [x] wanted", "the user's own tick is an x");
         assert_eq!(
             row(&form, "installed"),
-            console::style("  [ ] installed").red().to_string(),
+            _style("  [ ] installed").red().to_string(),
             "a fact undone"
         );
 
