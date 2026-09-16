@@ -38,7 +38,7 @@ pub mod ui;
 
 pub use prompts::{prompt_Yn, prompt_yN, prompt_yn}; // capitals mirror the [Y/n]/[y/N] each prints
 pub use menu::{run_menu, Chosen, Menu, Pick};
-pub use ui::{run, run_with_warnings, Outcome};
+pub use ui::{run, run_with_warnings, tint, Outcome};
 
 /// One entry of a form, in display order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -163,6 +163,15 @@ pub struct Choice {
     pub suggested: bool,
     /// Tags this option needs a COMPANION to carry — see [`Choice::requires`].
     pub requires: Vec<String>,
+    /// Text drawn after the name, aligned into a column across the group — a status, a verdict,
+    /// a remark. Display only: the name stays the answer, and nothing here reaches
+    /// [`Form::answers_toml`].
+    ///
+    /// Drawn AS GIVEN. The form colours a box and its name (red for a fact undone, blue for a
+    /// suggestion, green for a wanted companion) and never the note, so a caller may colour the
+    /// note itself — through [`tint`], so it obeys the same terminal gate — and know the form will
+    /// not paint over it. The grid's `#` remark is the other kind of note: prose, and dimmed.
+    pub note: Option<String>,
 }
 
 impl Choice {
@@ -177,7 +186,15 @@ impl Choice {
             tags: Vec::new(),
             suggested: false,
             requires: Vec::new(),
+            note: None,
         }
+    }
+
+    /// Text after the name, in a column of its own — see [`Choice::note`].
+    #[must_use]
+    pub fn note(mut self, note: impl Into<String>) -> Self {
+        self.note = Some(note.into());
+        self
     }
 
     /// Arrives ticked, as a FACT about the machine — drawn `[■]` rather than `[x]`, so the form's
@@ -570,6 +587,14 @@ impl Form {
     }
 
     /// A choose-one group: nothing chosen, all selectable, no sub-titles.
+    /// A checkbox group from ready-made [`Choice`]s — for callers with more to say per option than
+    /// a name: a heading, a note, tags, a tick that is a fact. [`Form::checkboxes`] is the short
+    /// form of this for the plain case.
+    pub fn choices(mut self, label: impl Into<String>, options: Vec<Choice>) -> Self {
+        self.items.push(Item::Checkboxes { label: label.into(), options });
+        self
+    }
+
     pub fn radio(mut self, label: impl Into<String>, options: &[&str]) -> Self {
         self.items.push(Item::Radio {
             label: label.into(),

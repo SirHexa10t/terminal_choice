@@ -483,6 +483,19 @@ pub(crate) fn _style<D>(val: D) -> console::StyledObject<D> {
     console::style(val).for_stderr()
 }
 
+/// `text` in the colour `rgb`, for a caller building a [`crate::Choice::note`] — or any text a
+/// form will draw.
+///
+/// The one public door to colour, and it exists because of the gate above: a caller reaching for
+/// `console::style` itself would consult stdout, and its colour would vanish under the redirect
+/// this crate's forms are meant to survive. True colour rather than the 256-cube, because the
+/// callers that need this are reproducing a colour from somewhere else — a source's own palette
+/// — and the nearest cube entry would be a different colour with the same name.
+#[must_use]
+pub fn tint(text: impl std::fmt::Display, (r, g, b): (u8, u8, u8)) -> String {
+    _style(text).true_color(r, g, b).to_string()
+}
+
 /// Paint `lines` over the frame already on screen, which was `previous` lines tall.
 ///
 /// One write, and no blank state in between. Both matter, and for different reasons.
@@ -835,6 +848,7 @@ pub(crate) fn compose(
                 if !label.is_empty() {
                     lines.push(format!("{label}:"));
                 }
+                let widths = _aligned_widths(form, index, &_name_widths(options, &clean));
                 for (option, entry) in options.iter().enumerate() {
                     match form.collapsible {
                         true => lines.extend(_fold_lines(form, index, option, false, rows, focus, &clean)),
@@ -845,7 +859,9 @@ pub(crate) fn compose(
                         continue;
                     }
                     let box_mark = _box(entry.checked, opened.ticked(index, 0, option));
-                    let row = format!("{box_mark} {}", clean(entry.name.clone()));
+                    let name = clean(entry.name.clone());
+                    let tail = _note_tail(entry, &name, widths[option], &clean);
+                    let row = format!("{box_mark} {name}");
                     // Colour BEFORE the focus mark, so that `mark`'s re-arming carries its reset
                     // through the reverse video rather than being cut short by it.
                     //
@@ -866,11 +882,13 @@ pub(crate) fn compose(
                         (_, _, true) => _style(row).color256(WANTED_GREEN).to_string(),
                         _ => row,
                     };
+                    // The note rides OUTSIDE every styling above: the form paints the box and the
+                    // name, and what the caller wrote after them stays exactly as written.
                     lines.push(match entry.enabled && form.incompatible_at(index, option).is_none() {
                         // Dim, and never marked: the focus list has no row for it, so `mark`
                         // could not report it focused anyway — this only says so visibly.
-                        false => _style(format!("  {row}")).dim().to_string(),
-                        true => mark(row, Focus::Option { item: index, option }),
+                        false => format!("{}{tail}", _style(format!("  {row}")).dim()),
+                        true => mark(format!("{row}{tail}"), Focus::Option { item: index, option }),
                     });
                     lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
                 }
@@ -879,6 +897,7 @@ pub(crate) fn compose(
                 if !label.is_empty() {
                     lines.push(format!("{label}:"));
                 }
+                let widths = _aligned_widths(form, index, &_name_widths(options, &clean));
                 for (option, entry) in options.iter().enumerate() {
                     match form.collapsible {
                         true => lines.extend(_fold_lines(form, index, option, false, rows, focus, &clean)),
@@ -889,14 +908,16 @@ pub(crate) fn compose(
                         continue;
                     }
                     let dot = if *chosen == Some(option) { "(•)" } else { "( )" };
-                    let row = format!("{dot} {}", clean(entry.name.clone()));
+                    let name = clean(entry.name.clone());
+                    let tail = _note_tail(entry, &name, widths[option], &clean);
+                    let row = format!("{dot} {name}");
                     let row = match form.wanted_among(&unmet, index, option) {
                         true => _style(row).color256(WANTED_GREEN).to_string(),
                         false => row,
                     };
                     lines.push(match entry.enabled && form.incompatible_at(index, option).is_none() {
-                        false => _style(format!("  {row}")).dim().to_string(),
-                        true => mark(row, Focus::Option { item: index, option }),
+                        false => format!("{}{tail}", _style(format!("  {row}")).dim()),
+                        true => mark(format!("{row}{tail}"), Focus::Option { item: index, option }),
                     });
                     lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
                 }
@@ -965,11 +986,9 @@ pub(crate) fn compose(
 
                 // Labels align into a column, so the notes after them do too — a ragged right
                 // edge of `#` remarks is harder to read past than no remarks at all.
-                let widest = grid
-                    .iter()
-                    .map(|row| console::measure_text_width(&row.label))
-                    .max()
-                    .unwrap_or(0);
+                let labels: Vec<usize> =
+                    grid.iter().map(|row| console::measure_text_width(&row.label)).collect();
+                let widths = _aligned_widths(form, index, &labels);
                 for (row, entry) in grid.iter().enumerate() {
                     let title = match form.collapsible {
                         true => _fold_lines(form, index, row, false, rows, focus, &clean),
@@ -1048,7 +1067,7 @@ pub(crate) fn compose(
                     let note = entry.note.as_ref().map_or(String::new(), |note| {
                         // Measured against the UNSTYLED label: an escape sequence has no width
                         // on screen, and counting one would push every note after it out of line.
-                        let gap = pad(&plain, widest);
+                        let gap = pad(&plain, widths[row]);
                         _style(format!("{gap}  # {}", clean(note.clone()))).dim().to_string()
                     });
                     lines.push(format!("{lead}{boxes}{named}{note}"));
@@ -1158,6 +1177,46 @@ pub(crate) fn viewport(frame: &Frame, height: usize, scroll: usize) -> (Vec<Stri
 /// The fewest body lines worth pinning a footer over. Below this the footer is the screen, and
 /// the question it is a footer TO would be invisible.
 const MIN_BODY: usize = 3;
+
+/// Each choice's name width as drawn — the raw material [`_aligned_widths`] turns into columns.
+fn _name_widths(options: &[crate::Choice], clean: &impl Fn(String) -> String) -> Vec<usize> {
+    options.iter().map(|entry| console::measure_text_width(&clean(entry.name.clone()))).collect()
+}
+
+/// The column width each slot of item `index` aligns its trailing text to: the widest of its OWN
+/// section, not of the whole item.
+///
+/// Sections are the unit because a form long enough to have them is long enough for one outlier
+/// to spoil the rest: a single forty-character name in one section would otherwise push every
+/// note and remark in every other section forty characters to the right, past where anyone is
+/// looking. Slots before the first heading form a group of their own — they belong to no section,
+/// and their neighbours are each other.
+fn _aligned_widths(form: &Form, index: usize, widths: &[usize]) -> Vec<usize> {
+    let mut aligned = vec![0; widths.len()];
+    let mut start = 0;
+    while start < widths.len() {
+        let section = form.section_head(index, start);
+        let end = (start..widths.len())
+            .find(|slot| form.section_head(index, *slot) != section)
+            .unwrap_or(widths.len());
+        let widest = widths[start..end].iter().copied().max().unwrap_or(0);
+        aligned[start..end].fill(widest);
+        start = end;
+    }
+    aligned
+}
+
+/// What follows a choice's name: nothing, or the padding that brings the group's notes into one
+/// column and then the note as the caller wrote it (cleaned only when the form scrubs colour).
+fn _note_tail(entry: &crate::Choice, name: &str, widest: usize, clean: &impl Fn(String) -> String) -> String {
+    match &entry.note {
+        None => String::new(),
+        Some(note) => {
+            let pad = " ".repeat(widest.saturating_sub(console::measure_text_width(name)));
+            format!("{pad}  {}", clean(note.clone()))
+        }
+    }
+}
 
 /// The marker a foldable section draws: `>` shut, `v` open, `^` closing an open one.
 ///
@@ -2660,7 +2719,7 @@ mod tests {
                 "packages:",
                 "apt  flatpak  snap",
                 "# tools",
-                "[■]   ·        ·    git      # version control",
+                "[■]   ·        ·    git  # version control",
                 "# browsers",
                 " ·   [■]      [ ]   brave",
                 "[ ]  [ ]      [ ]   firefox",
@@ -2804,7 +2863,7 @@ mod tests {
         };
         assert_eq!(
             git_row(&form),
-            "[■]   ·        ·    git      # version control",
+            "[■]   ·        ·    git  # version control",
             "unchanged, unmarked"
         );
 
@@ -2814,7 +2873,7 @@ mod tests {
         // enabled here — under NO_COLOR the box is plain and the row is otherwise identical.
         assert_eq!(
             git_row(&form),
-            format!("{}   ·        ·    git      # version control", _style("[ ]").red()),
+            format!("{}   ·        ·    git  # version control", _style("[ ]").red()),
             "a cell that arrived ticked and was cleared is marked"
         );
     }
@@ -3853,5 +3912,117 @@ mod tests {
             .find(|line| line.contains("brave"))
             .expect("drawn");
         assert!(line.contains("[■]") && line.contains("[x]"), "a fact and a suggestion: {line:?}");
+    }
+
+    // ——— notes on choices ———————————————————————————————————————————————————
+
+    /// A note is a column: every note in the group starts where the longest name ends, whatever
+    /// the row's own name is — and it is display only, so the answers never see it.
+    #[test]
+    fn notes_line_up_in_a_column_and_stay_out_of_the_answers() {
+        let form = Form::new().choices(
+            "packages",
+            vec![
+                Choice::named("short").ticked().note("del-safe: Yes"),
+                Choice::named("a-much-longer-name").note("del-safe: No"),
+                Choice::named("bare"),
+            ],
+        );
+        let lines = drawn(&form);
+        let column = |want: &str| {
+            let line = lines.iter().find(|line| line.contains(want)).expect("drawn");
+            console::measure_text_width(&line[..line.find(want).unwrap()])
+        };
+        assert_eq!(column("del-safe: Yes"), column("del-safe: No"), "one column: {lines:#?}");
+        assert!(lines.iter().any(|line| line.trim_end().ends_with("[ ] bare")), "no note, no tail");
+        assert_eq!(form.checked("packages"), ["short"]);
+        assert!(!form.answers_toml().contains("del-safe"), "{}", form.answers_toml());
+    }
+
+    /// The form styles the box and the name and leaves the note as written — so a note the caller
+    /// coloured keeps its colour on a row the form has turned red, and scrubbing strips it like
+    /// any other colour.
+    #[test]
+    fn a_note_is_drawn_as_given_outside_the_rows_own_styling() {
+        let painted = tint("Yes", (0x6a, 0xa8, 0x4f));
+        let mut form =
+            Form::new().choices("packages", vec![Choice::named("thing").ticked().note(format!("del-safe: {painted}"))]);
+        let opened = Opened::of(&form);
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = false; // a fact undone: the row goes red
+        let rows = focusables(&form);
+        let line = render(&form, &rows, rows.len() - 1, 120, &[], &opened).remove(1);
+        let head = _style("[ ] thing").red().to_string();
+        assert!(line.starts_with(&format!("  {head}")), "the head is red: {line:?}");
+        assert!(line.ends_with(&format!("  del-safe: {painted}")), "and the note follows untouched: {line:?}");
+
+        let scrubbed = drawn(&form.clone().scrub_colors());
+        assert!(scrubbed.iter().any(|line| line.ends_with("del-safe: Yes")), "{scrubbed:#?}");
+    }
+
+    /// `tint` is the caller's way to colour a note through the same gate the form uses.
+    #[test]
+    fn tint_paints_through_the_forms_own_gate() {
+        assert_eq!(tint("Yes", (1, 2, 3)), _style("Yes").true_color(1, 2, 3).to_string());
+        assert!(console::strip_ansi_codes(&tint("Yes", (1, 2, 3))) == "Yes");
+    }
+
+    // ——— alignment is per section ————————————————————————————————————————
+
+    /// A remark or a note is aligned to the widest name in its OWN section. One long name in the
+    /// first section moves nothing in the second — which is the whole point of doing it per
+    /// section, and what makes a six-hundred-row grid readable past its one outlier.
+    #[test]
+    fn trailing_text_aligns_to_its_own_section_not_the_whole_item() {
+        let grid = Form::new().grid(
+            "",
+            &["apt"],
+            vec![
+                GridRow::named("an-extraordinarily-long-package-name").heading("one").note("a").cells(vec![GridCell::open(None)]),
+                GridRow::named("x").note("b").cells(vec![GridCell::open(None)]),
+                GridRow::named("y").heading("two").note("c").cells(vec![GridCell::open(None)]),
+                GridRow::named("yy").note("d").cells(vec![GridCell::open(None)]),
+            ],
+        );
+        let lines = drawn(&grid);
+        let column = |label: &str, note: &str| {
+            let line = lines.iter().find(|line| line.contains(&format!(" {label} ")) || line.contains(&format!("{label}  # {note}"))).expect(label);
+            line.find(&format!("# {note}")).expect("the remark")
+        };
+        assert_eq!(column("an-extraordinarily-long-package-name", "a"), column("x", "b"), "one column within a section");
+        assert_eq!(column("y", "c"), column("yy", "d"));
+        assert!(column("y", "c") < column("x", "b"), "and the second section is not pushed out by the first: {lines:#?}");
+
+        let choices = Form::new().choices(
+            "",
+            vec![
+                Choice::named("an-extraordinarily-long-option-name").heading("one").note("A"),
+                Choice::named("x").note("B"),
+                Choice::named("y").heading("two").note("C"),
+            ],
+        );
+        let lines = drawn(&choices);
+        let at = |note: &str| lines.iter().find_map(|line| line.find(&format!("  {note}")).filter(|_| line.ends_with(note))).expect(note);
+        assert_eq!(at("A"), at("B"));
+        assert!(at("C") < at("B"), "{lines:#?}");
+    }
+
+    /// The grouping itself, on plain numbers: runs between headings share a width, slots before
+    /// the first heading are their own run, and an item with no headings is one run.
+    #[test]
+    fn aligned_widths_group_by_section_head() {
+        let form = Form::new().choices(
+            "",
+            vec![
+                Choice::named("loose"),
+                Choice::named("a").heading("one"),
+                Choice::named("bb"),
+                Choice::named("c").heading("two"),
+            ],
+        );
+        assert_eq!(_aligned_widths(&form, 0, &[5, 1, 2, 1]), [5, 2, 2, 1]);
+        let flat = Form::new().checkboxes("", &["a", "bbb", "cc"]);
+        assert_eq!(_aligned_widths(&flat, 0, &[1, 3, 2]), [3, 3, 3], "no headings: one run");
+        assert!(_aligned_widths(&flat, 0, &[]).is_empty());
     }
 }

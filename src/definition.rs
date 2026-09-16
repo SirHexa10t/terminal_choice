@@ -35,8 +35,9 @@ impl Choices {
                 tags: Vec::new(),
                 suggested: false,
                 // A TOML definition states no tags, so it can state no tag requirement either —
-                // there would be nothing for one to name. Both arrive from code.
+                // there would be nothing for one to name. Both arrive from code, as does a note.
                 requires: Vec::new(),
+                note: None,
             })
             .collect()
     }
