@@ -79,8 +79,8 @@ impl Opened {
         )
     }
 
-    /// Whether the box at `item`/`row`/`slot` arrived ticked — a fact about the machine, which is
-    /// what earns it the [`GIVEN`] glyph while it stands and the red mark when it is cleared.
+    /// Whether the box at `item`/`row`/`slot` arrived ticked — a fact the caller established,
+    /// which is what earns it the [`GIVEN`] glyph while it stands and the red mark when cleared.
     fn ticked(&self, item: usize, row: usize, slot: usize) -> bool {
         self.0.get(item).and_then(|rows| rows.get(row)).and_then(|ticks| ticks.get(slot)) == Some(&true)
     }
@@ -150,7 +150,7 @@ pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
                     // a disabled one does not: the cursor cannot reach what does not exist here.
                     if entry.enabled
                         && !form.hidden(index, option)
-                        && form.incompatible_at(index, option).is_none()
+                        && form.ruled_out_at(index, option).is_none()
                     {
                         rows.push(Focus::Option { item: index, option });
                     }
@@ -167,7 +167,7 @@ pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
             Item::Grid { rows: grid, .. } => {
                 for (row, entry) in grid.iter().enumerate() {
                     rows.extend(_fold_stop(form, index, row));
-                    if !form.hidden(index, row) && form.incompatible_at(index, row).is_none() {
+                    if !form.hidden(index, row) && form.ruled_out_at(index, row).is_none() {
                         rows.extend(
                             entry.cells.iter().enumerate().filter(|(_, cell)| cell.enabled).map(
                                 |(column, _)| Focus::Cell { item: index, row, column },
@@ -238,7 +238,7 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
                 for (index, item) in form.items.iter().enumerate() {
                     if let Item::Checkboxes { options, .. } = item {
                         for (option, entry) in options.iter().enumerate() {
-                            if entry.enabled && form.incompatible_at(index, option).is_none() {
+                            if entry.enabled && form.ruled_out_at(index, option).is_none() {
                                 live.push((index, option, entry.checked));
                             }
                         }
@@ -381,7 +381,7 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
                     // A twin the user cannot touch is not moved by touching its sibling either —
                     // "not yours to change" holds from every angle, and a rule-greyed twin is as
                     // locked as a disabled one. (Which CAN leave twins disagreeing, exactly as
-                    // disabled twins always could: the locked one keeps reporting the machine,
+                    // disabled twins always could: the locked one keeps reporting what it was told,
                     // the live one the answer. The contradiction to avoid was two ANSWERS.)
                     let locked: Vec<(usize, usize)> = form
                         .items
@@ -389,7 +389,7 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
                         .enumerate()
                         .flat_map(|(index, item)| match item {
                             Item::Checkboxes { options, .. } => (0..options.len())
-                                .filter(|option| form.incompatible_at(index, *option).is_some())
+                                .filter(|option| form.ruled_out_at(index, *option).is_some())
                                 .map(|option| (index, option))
                                 .collect(),
                             _ => Vec::new(),
@@ -884,7 +884,7 @@ pub(crate) fn compose(
                     };
                     // The note rides OUTSIDE every styling above: the form paints the box and the
                     // name, and what the caller wrote after them stays exactly as written.
-                    lines.push(match entry.enabled && form.incompatible_at(index, option).is_none() {
+                    lines.push(match entry.enabled && form.ruled_out_at(index, option).is_none() {
                         // Dim, and never marked: the focus list has no row for it, so `mark`
                         // could not report it focused anyway — this only says so visibly.
                         false => format!("{}{tail}", _style(format!("  {row}")).dim()),
@@ -915,7 +915,7 @@ pub(crate) fn compose(
                         true => _style(row).color256(WANTED_GREEN).to_string(),
                         false => row,
                     };
-                    lines.push(match entry.enabled && form.incompatible_at(index, option).is_none() {
+                    lines.push(match entry.enabled && form.ruled_out_at(index, option).is_none() {
                         false => format!("{}{tail}", _style(format!("  {row}")).dim()),
                         true => mark(format!("{row}{tail}"), Focus::Option { item: index, option }),
                     });
@@ -1011,9 +1011,9 @@ pub(crate) fn compose(
                         lines.extend(_fold_lines(form, index, row, true, rows, focus, &clean));
                         continue;
                     }
-                    // One question per row rather than per cell: an entry this machine cannot
+                    // One question per row rather than per cell: an entry the caller ruled out cannot
                     // run is out of reach through EVERY manager, so the whole row locks together.
-                    let greyed = form.incompatible_at(index, row).is_some();
+                    let greyed = form.ruled_out_at(index, row).is_some();
                     let boxes: String = entry
                         .cells
                         .iter()
@@ -1350,9 +1350,9 @@ const FOLD_FOOT_VIOLET: u8 = 97;
 /// the only one that is a recommendation rather than a report.
 const SUGGESTED_BLUE: u8 = 39;
 
-/// A box ticked by the MACHINE — installed already, or otherwise so when the form opened. A filled
-/// square, and the point is that it is not an `x`: nobody put it there, so a reader can tell the
-/// form's facts from their own choices at a glance. Clearing it undoes a fact and is marked red;
+/// A box that arrived ALREADY TICKED — so of the world when the form opened, whatever the caller
+/// checked to know it. A filled square, and the point is that it is not an `x`: the user did not
+/// put it there, so a reader can tell what they were told from what they chose at a glance. Clearing it undoes a fact and is marked red;
 /// ticking it again brings the square back rather than an `x`, because what the square says is
 /// "as it was when we started", and that is true again.
 ///
@@ -1396,7 +1396,7 @@ const CTRL_S: char = '\u{13}';
 /// Green for the same reason suggestions are blue: it is the form pointing, not a state the user
 /// set. Blue says "we think you want this"; green says "you must pick one of these". Both stop
 /// as soon as the user has acted, and neither counts as a deviation from what the form opened
-/// with, because neither is a claim about the machine.
+/// with, because neither is a claim the caller made about the world.
 const WANTED_GREEN: u8 = 42;
 
 /// What the focused cell would do: the line that fills it while it is empty, the line that
@@ -1454,7 +1454,7 @@ pub fn run(form: &mut Form) -> std::io::Result<Outcome> {
 ///
 /// `warn` is the per-repaint hook: called fresh every time the form is drawn, with the form as it
 /// stands. What it says is entirely the caller's business, and nothing here constrains it — it
-/// may consult the machine, the filesystem, its own tables. That is the point of a closure over
+/// may consult the environment, the filesystem, its own tables. That is the point of a closure over
 /// the file vocabulary in [`crate::Condition`]: "this path already exists", "that needs a reboot"
 /// are not things a form library can be taught, and any program should warn for its own reasons.
 ///
@@ -2190,7 +2190,7 @@ mod tests {
 
     // ——— suggestions ——————————————————————————————————————————————————————
 
-    /// Three ticks, three meanings: one the machine already has, one the form recommends, one
+    /// Three ticks, three meanings: one already true when the form opened, one the form recommends, one
     /// empty. The middle one is the case under test.
     fn suggested_form() -> Form {
         let mut form = Form::new().checkboxes("packages", &["installed", "recommended", "neither"]);
@@ -3281,7 +3281,7 @@ mod tests {
 
     // ——— greying, green, and a Submit that refuses ————————————————————————
 
-    /// Two rows, one of them something this machine cannot run.
+    /// Two rows, one of them ruled out by the caller.
     fn sessions(picked: bool) -> Form {
         let row = |label: &str, tag: &str, on: bool| {
             GridRow::named(label)
@@ -3291,11 +3291,11 @@ mod tests {
         };
         Form::new()
             .grid("", &["apt"], vec![row("hyprland", "wayland-only", picked), row("i3", "x11-only", false)])
-            .incompatible(&[(&["wayland-only"], "this session is X11")])
+            .ruled_out(&[(&["wayland-only"], "this session is X11")])
     }
 
     /// Greyed is not hidden, and that is the whole point: the row still draws, so a reader can
-    /// see the choice exists and that something about the machine puts it out of reach. What it
+    /// see the choice exists and that something outside the form puts it out of reach. What it
     /// loses is the cursor — there is no focus row for it, which IS the "not yours to change".
     #[test]
     fn an_incompatible_row_still_draws_but_no_key_can_reach_it() {
@@ -3403,7 +3403,7 @@ mod tests {
     fn select_all_cannot_touch_what_the_machine_ruled_out() {
         let mut form = Form::new()
             .checkboxes("apps", &["i3", "hyprland"])
-            .incompatible(&[(&["wayland-only"], "this session is X11")]);
+            .ruled_out(&[(&["wayland-only"], "this session is X11")]);
         let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!("boxes") };
         options[1].tags = vec!["wayland-only".into()];
 
@@ -3429,7 +3429,7 @@ mod tests {
             .checkboxes("by cpu", &["wayvnc"])
             .checkboxes("by memory", &["wayvnc"])
             .mirror_duplicates()
-            .incompatible(&[(&["wayland-only"], "this session is X11")]);
+            .ruled_out(&[(&["wayland-only"], "this session is X11")]);
         let Item::Checkboxes { options, .. } = &mut form.items[1] else { panic!("boxes") };
         options[0].tags = vec!["wayland-only".into()];
 
@@ -3451,7 +3451,7 @@ mod tests {
     #[test]
     fn greying_a_row_does_not_touch_what_it_already_says() {
         let form = sessions(true);
-        assert!(form.chosen_at(0, 0), "the tick is a fact about the machine, not an offer");
+        assert!(form.chosen_at(0, 0), "the tick is a fact the caller established, not an offer");
         assert!(form.objections().is_empty(), "and greying alone blocks nothing");
     }
 
@@ -3850,7 +3850,7 @@ mod tests {
         assert_eq!(names(&plain), 1);
     }
 
-    // ——— the given glyph: the machine's ticks against the user's ————————————
+    // ——— the given glyph: ticks the caller supplied against the user's own ————
 
     /// Three ticks, three glyphs: a box that arrived ticked is `[■]`, a box the user ticks is
     /// `[x]`, and a suggestion is `[x]` too — told apart by colour, since it asserts nothing.

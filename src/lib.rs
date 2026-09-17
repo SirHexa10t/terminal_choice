@@ -16,8 +16,8 @@
 //! clients at once", "that path already exists" are facts about someone's domain, not about
 //! forms — so there are two ways in, and a run shows both:
 //!
-//! - **A closure**, via [`run_with_warnings`]. Bound by nothing: it may consult the machine, the
-//!   network, the caller's own tables. This is the general door.
+//! - **A closure**, via [`run_with_warnings`]. Bound by nothing: it may consult the environment,
+//!   the network, the caller's own tables. This is the general door.
 //! - **The definition itself**, via [`Form::warning`] or a `[[warning]]` block in the TOML. A
 //!   file cannot carry a closure, so these are written in the fixed vocabulary of [`Condition`]
 //!   — enough for "these were ticked together", which is most of them.
@@ -57,8 +57,8 @@ pub enum Item {
     Text { label: String, value: String },
     /// A table of checkboxes: one row per thing, one column per way of having it.
     ///
-    /// For the choice that is not "which of these" but "which of these, HOW" — a package and the
-    /// managers that carry it, a file and the machines to write it to. A row of independent
+    /// For the choice that is not "which of these" but "which of these, HOW" — a thing to obtain
+    /// and the several routes to it, a file and the several places to send it. A row of independent
     /// checkbox groups could hold the same answers, but not the same question: the point is that
     /// the columns line up down the page, so a column can be read as a column.
     Grid {
@@ -197,8 +197,8 @@ impl Choice {
         self
     }
 
-    /// Arrives ticked, as a FACT about the machine — drawn `[■]` rather than `[x]`, so the form's
-    /// facts and the user's own ticks are told apart at a glance. Clearing it is a deviation, and
+    /// Arrives ticked, as a FACT THE CALLER ESTABLISHED — drawn `[■]` rather than `[x]`, so what
+    /// the form was told and what the user chose are told apart at a glance. Clearing it is a deviation, and
     /// marked red; ticking it again brings the `[■]` back.
     #[must_use]
     pub fn ticked(mut self) -> Self {
@@ -359,7 +359,7 @@ pub struct GridCell {
     pub on_set: Option<String>,
     /// What clearing this would do, shown while the cursor is on it and it is TICKED.
     pub on_clear: Option<String>,
-    /// This tick is a SUGGESTION, not a fact about the machine — see [`GridCell::suggest`].
+    /// This tick is a SUGGESTION, not a fact the caller established — see [`GridCell::suggest`].
     pub suggested: bool,
 }
 
@@ -371,7 +371,7 @@ impl GridCell {
     }
 
     /// A cell that arrives ticked, and would do `on_clear` if emptied. Drawn `[■]`, the glyph of a
-    /// fact about the machine, where a tick the user adds is `[x]`.
+    /// fact the caller established, where a tick the user adds is `[x]`.
     #[must_use]
     pub fn set(on_clear: Option<String>) -> Self {
         Self { checked: true, enabled: true, boxed: true, on_set: None, on_clear, suggested: false }
@@ -439,9 +439,10 @@ pub struct Warning {
 ///
 /// This is a SERIALIZATION vocabulary, not the warning mechanism. A TOML document cannot carry a
 /// closure, so the conditions a definition file can state have to be a fixed, named set — and a
-/// fixed set can only ever cover the cases one author imagined. Anything outside it (a fact about
-/// the machine, a regex over a text field, a rule consulting something this crate has never heard
-/// of) goes in the closure [`run_with_warnings`] takes, which is bound by nothing here. The two
+/// fixed set can only ever cover the cases one author imagined. Anything outside it (a fact from
+/// the world the caller lives in, a regex over a text field, a rule consulting something this
+/// crate has never heard of) goes in the closure [`run_with_warnings`] takes, which is bound by
+/// nothing here. The two
 /// compose: a run shows the form's own warnings AND whatever the closure adds.
 ///
 /// Every leaf names its group by label and is FALSE when no such group exists. That asymmetry is
@@ -535,22 +536,25 @@ pub struct Form {
     /// Which filter boxes are currently CLEARED, by [`Rule::label`]. Display state, like
     /// `collapsed`: an entry filtered out of sight keeps every answer it had.
     pub excluded: std::collections::BTreeSet<String>,
-    /// Entries this machine cannot offer at all — greyed out, not hidden, and not the user's to
-    /// change. Each [`Rule::label`] says WHY, so a caller can explain itself.
+    /// Entries the caller has RULED OUT — greyed out, not hidden, and not the user's to change.
+    /// Each [`Rule::label`] says WHY, so a caller can explain itself.
     ///
-    /// Deliberately not filter boxes, and the difference is who the answer belongs to. A filter
-    /// is a PREFERENCE, and a preference is revisable: "I do not much like terminal programs, but
-    /// this one looks worth a go" is a sentence somebody says, so the box has to let them say it.
-    /// Nobody revisably runs one program on a display server they are not running. That is the
-    /// machine's answer rather than the user's, so it greys the row instead of offering a box —
-    /// and greyed rather than hidden, because a reader should see that the choice exists and why
-    /// it is out of reach.
-    pub incompatible: Vec<Rule>,
+    /// Deliberately not filter boxes, and the difference is who the answer belongs to. A filter is
+    /// a PREFERENCE, and a preference is revisable: "I do not much like the long options, but this
+    /// one looks worth a go" is a sentence somebody says, so the box has to let them say it. A
+    /// ruled-out entry is not a preference at all — something outside the form has already settled
+    /// it, and no amount of wanting changes the answer. So it greys the row instead of offering a
+    /// box, and greys rather than hides, because a reader should see that the choice exists and
+    /// why it is out of reach.
+    ///
+    /// This crate never asks WHAT settled it. The caller supplies the rules and the reasons; the
+    /// form draws them.
+    pub ruled_out: Vec<Rule>,
     /// At most ONE chosen entry may match each of these, form-wide. A second is a conflict, and
     /// the form refuses to submit while it stands — see [`Form::objections`].
     ///
-    /// Said in tags rather than as pairs of names: "at most one `display-manager`" is one line
-    /// however many display managers the catalogue grows, where a list of incompatible pairs is
+    /// Said in tags rather than as pairs of names: "at most one `exclusive-thing`" stays one line
+    /// however many such entries the caller grows, where a list of mutually-exclusive PAIRS is
     /// quadratic and needs editing every time one is added.
     pub exclusive: Vec<Rule>,
 }
@@ -713,22 +717,22 @@ impl Form {
     }
 
     /// Every box of the filter block, in display order: the ones the caller offered, then one
-    /// per incompatibility rule.
+    /// per ruled-out rule.
     ///
-    /// An incompatibility gets a box FOR FREE, and that is the whole reason the two lists join
+    /// A ruled-out rule gets a box FOR FREE, and that is the whole reason the two lists join
     /// here rather than being drawn separately. A rule that locks entries away has already
     /// decided they cannot be picked; all a box adds is the choice to stop looking at them. It
     /// hides nothing the user could have had — which is what makes it safe to offer, and
     /// different in kind from every other box in the block.
     ///
     /// It also answers the question the greying could not. A dim row with no explanation is a
-    /// puzzle; a dim row plus a box saying `incompatible display server` is a sentence. The
-    /// label does both jobs, which is why there is one string and not two.
+    /// puzzle; a dim row plus a box carrying the rule's own reason is a sentence. The label does
+    /// both jobs, which is why there is one string and not two.
     ///
     /// [`Rule::label`] is the identity in [`Form::excluded`], so a label repeated across the two
     /// lists would make one box work the other's rows. Keep them distinct.
     pub fn filter_boxes(&self) -> impl Iterator<Item = &Rule> {
-        self.filters.iter().chain(self.incompatible.iter())
+        self.filters.iter().chain(self.ruled_out.iter())
     }
 
     /// Whether slot `slot` of item `index` carries a tag the user has cleared.
@@ -743,12 +747,28 @@ impl Form {
             .any(|rule| rule.matches(tags))
     }
 
-    /// Grey out every entry matching one of `rules` — see [`Form::incompatible`].
+    /// Grey out every entry matching one of `rules` — see [`Form::ruled_out`].
     ///
-    /// Each pair is the rule's terms and the reason: `(&["wayland-only"], "this session is X11")`.
-    /// Terms take the same `!` negation [`Rule::of`] reads everywhere else.
-    pub fn incompatible(mut self, rules: &[(&[&str], &str)]) -> Self {
-        self.incompatible = rules.iter().map(|(terms, why)| Rule::of(*why, terms)).collect();
+    /// Each pair is the rule's terms and the reason the caller would give a reader:
+    /// `(&["needs-network"], "this run is offline")`. Terms take the same `!` negation
+    /// [`Rule::of`] reads everywhere else.
+    pub fn ruled_out(mut self, rules: &[(&[&str], &str)]) -> Self {
+        self.ruled_out = rules.iter().map(|(terms, why)| Rule::of(*why, terms)).collect();
+        self
+    }
+
+    /// Open with every ruled-out rule's box CLEARED, so the entries nothing can offer are out of
+    /// sight until asked for. Call it after [`Form::ruled_out`] is set — it clears the boxes that
+    /// exist when it is called.
+    ///
+    /// The default for a long form, and the reason is what those rows are: noise, not a question.
+    /// Greying keeps them visible so a reader knows the choice exists; on a table of hundreds
+    /// that visibility is a cost paid on every screen, and the box is the way to pay it only when
+    /// wanted. The rows themselves are untouched — hidden, still ticked, still counted.
+    pub fn hide_ruled_out(mut self) -> Self {
+        for rule in &self.ruled_out {
+            self.excluded.insert(rule.label.clone());
+        }
         self
     }
 
@@ -758,25 +778,25 @@ impl Form {
         self
     }
 
-    /// Whether slot `slot` of item `index` is one this machine cannot offer, and why.
+    /// Whether slot `slot` of item `index` is one the caller ruled out, and why.
     ///
     /// Evaluated on demand rather than baked into each entry's `enabled` at build time, so that
     /// the answer cannot depend on the order a form was assembled in — the same reason
     /// [`Form::filtered_out`] is a question and not a stored flag.
     #[must_use]
-    pub fn incompatible_at(&self, index: usize, slot: usize) -> Option<&Rule> {
-        if self.incompatible.is_empty() {
+    pub fn ruled_out_at(&self, index: usize, slot: usize) -> Option<&Rule> {
+        if self.ruled_out.is_empty() {
             return None;
         }
         let tags = self.tags_at(index, slot);
-        self.incompatible.iter().find(|rule| rule.matches(tags))
+        self.ruled_out.iter().find(|rule| rule.matches(tags))
     }
 
     /// Whether slot `slot` of item `index` is CHOSEN — ticked, picked, or, in a grid, ticked in
     /// any column at all.
     ///
-    /// A grid row is chosen if any one of its cells is, because the columns are ways of having
-    /// the same thing: a package installed through apt is installed.
+    /// A grid row is chosen if any one of its cells is, because the columns are alternative WAYS
+    /// of having the one thing the row names — however it was had, it was had.
     #[must_use]
     pub fn chosen_at(&self, index: usize, slot: usize) -> bool {
         match self.items.get(index) {
@@ -844,8 +864,8 @@ impl Form {
     ///
     /// The split exists for the repaint: `unmet` walks every slot, and asking it fresh per row
     /// would make drawing quadratic in the table's length — unnoticeable at sixty rows and a
-    /// stutter at the six hundred the catalogue is heading for. One computation per frame, then
-    /// this per row.
+    /// stutter at the several hundred a long table reaches. One computation per frame, then this
+    /// per row.
     #[must_use]
     pub fn wanted_among(&self, unmet: &[String], index: usize, slot: usize) -> bool {
         if unmet.is_empty() || self.chosen_at(index, slot) {
@@ -873,9 +893,9 @@ impl Form {
 
     /// Every reason this form refuses to be submitted, as lines to show. Empty means it will go.
     ///
-    /// The two sources meet HERE and nowhere else. A conflict is a fact about the catalogue —
-    /// one rule over the whole form, at most one — and a requirement is a fact about an entry in
-    /// it — one rule per entry, at least one. They are stated in different places for that
+    /// The two sources meet HERE and nowhere else. A conflict is a fact about the FORM — one rule
+    /// over the whole of it, at most one — and a requirement is a fact about an ENTRY — one rule
+    /// per entry, at least one. They are stated in different places for that
     /// reason, and they arrive at the same button, which is why the refusal is one function
     /// rather than two competing ones.
     #[must_use]
@@ -1089,8 +1109,8 @@ impl Form {
     /// predicates.
     ///
     /// Those are opaque strings here: `"path:zed"` means nothing to this crate, and `resolve`
-    /// says whether it is true of the machine in front of it. Same division as warnings — a form
-    /// library cannot know what makes a box worth pre-ticking on someone else's system, so it
+    /// says whether it is true where the form is running. Same division as warnings — a form
+    /// library cannot know what makes a box worth pre-ticking in somebody else's world, so it
     /// carries the question and the caller answers it.
     ///
     /// [`Form::from_toml`] is this with nobody answering, and the two unanswered defaults differ
@@ -1110,7 +1130,7 @@ impl Form {
     /// "#;
     /// let form = Form::from_toml_with(text, |spec| spec.starts_with("installed:")).unwrap();
     /// let Item::Checkboxes { options, .. } = &form.items[0] else { panic!() };
-    /// assert_eq!(options[0].checked, true, "the machine already has zed");
+    /// assert_eq!(options[0].checked, true, "the caller's check said yes");
     /// assert_eq!(options[1].checked, false);
     /// assert_eq!(options[1].enabled, false, "and apt is not this user's to change");
     /// ```
@@ -1476,8 +1496,8 @@ mod tests {
         assert_eq!(both.objections(), ["only one display manager"]);
     }
 
-    /// The two sources meet at the button and only there — a fact about the catalogue and a fact
-    /// about an entry in it, arriving as one list of reasons not to go.
+    /// The two sources meet at the button and only there — a fact about the form and a fact about
+    /// an entry in it, arriving as one list of reasons not to go.
     #[test]
     fn objections_gather_both_kinds_and_are_empty_when_the_form_is_sound() {
         let mut form = table(&[
@@ -1495,8 +1515,8 @@ mod tests {
         assert!(sound.objections().is_empty(), "nothing to say, so it may go");
     }
 
-    /// A grid row is chosen if ANY of its columns is: the columns are ways of having the same
-    /// thing, and a package installed through apt is installed.
+    /// A grid row is chosen if ANY of its columns is: the columns are alternative ways of having
+    /// the one thing the row names, and however it was had, it was had.
     #[test]
     fn a_grid_row_counts_as_chosen_through_any_one_column() {
         let form = Form::new().grid(
@@ -1507,17 +1527,17 @@ mod tests {
         assert!(form.chosen_at(0, 0), "ticked in the second column, so it is had");
     }
 
-    /// Greying is a claim about the MACHINE, so it is a rule the caller supplies rather than
+    /// Greying is a claim from OUTSIDE the form, so it is a rule the caller supplies rather than
     /// state on the entry — and it says why, which is what the label is for.
     #[test]
-    fn an_incompatible_entry_is_named_by_its_tags_and_carries_its_reason() {
+    fn a_ruled_out_entry_is_named_by_its_tags_and_carries_its_reason() {
         let form = table(&[("hyprland", &["wayland-only"], &[], false), ("i3", &["x11-only"], &[], false)])
-            .incompatible(&[(&["wayland-only"], "this session is X11")]);
-        assert_eq!(form.incompatible_at(0, 0).map(|rule| rule.label.as_str()), Some("this session is X11"));
-        assert_eq!(form.incompatible_at(0, 1), None, "i3 is the one that runs here");
+            .ruled_out(&[(&["wayland-only"], "this session is X11")]);
+        assert_eq!(form.ruled_out_at(0, 0).map(|rule| rule.label.as_str()), Some("this session is X11"));
+        assert_eq!(form.ruled_out_at(0, 1), None, "i3 is the one that runs here");
 
         // No rules at all is the common case and must not cost a tag lookup per row.
-        assert_eq!(table(&[("i3", &["x11-only"], &[], false)]).incompatible_at(0, 0), None);
+        assert_eq!(table(&[("i3", &["x11-only"], &[], false)]).ruled_out_at(0, 0), None);
     }
 
     /// Opening shut is a whole-form choice, taken after the items exist: every heading slot and
@@ -1559,5 +1579,21 @@ mod tests {
         form.excluded.insert("terminal-only".into());
         assert!(form.filtered_out(0, 0), "rg is hidden by the cleared box");
         assert_eq!(form.governed(&terminal_only), 2, "and still counted: the rule did not change");
+    }
+
+    /// The incompatibility boxes can open cleared: their rows hide from the first frame and come
+    /// back through the box, the ordinary filters are untouched, and a form with no such rules is
+    /// unchanged by asking.
+    #[test]
+    fn hiding_ruled_out_clears_exactly_those_boxes() {
+        let mut form = table(&[("hyprland", &["wayland-only"], &[], false), ("i3", &["x11-only"], &[], false)])
+            .ruled_out(&[(&["wayland-only"], "this session is X11")]);
+        form.filters = vec![Rule::of("terminal-only", &["terminal", "!gui"])];
+        assert!(form.excluded.is_empty(), "nothing hidden until asked");
+        let form = form.hide_ruled_out();
+        assert_eq!(form.excluded.iter().collect::<Vec<_>>(), ["this session is X11"]);
+        assert!(form.filtered_out(0, 0), "the wayland row is out of sight");
+        assert!(!form.filtered_out(0, 1), "the X11 one is not");
+        assert!(table(&[("i3", &["x11-only"], &[], false)]).hide_ruled_out().excluded.is_empty());
     }
 }
