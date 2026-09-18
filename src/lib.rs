@@ -144,7 +144,24 @@ impl Rule {
 /// assert!(!plain.checked && plain.enabled);
 /// assert!(more.checked && more.heading.as_deref() == Some("# vpn"));
 /// ```
+///
+/// **Fluently is the only way, from outside this crate.** The type is `#[non_exhaustive]`, so a
+/// program using it cannot write `Choice { .. }` — and therefore cannot be broken by a field
+/// appearing here, which is the one change this type is certain to keep seeing: `sub` was the
+/// last, and every one before it broke every struct literal in existence. The builders take a
+/// field's arrival in their stride, so there is nothing for a caller to update.
+///
+/// It costs a caller nothing they had. Reading a field is untouched, and so is WRITING one on a
+/// value already in hand — `option.checked = true` over a group reached through the form's own
+/// `items` keeps working, which is how a caller sets a starting state the builders were not there
+/// for. Only conjuring a whole `Choice` out of field names is gone, and [`Choice::named`] is that,
+/// with defaults for the fields the caller was going to leave alone anyway.
+///
+/// The attribute is here rather than pencilled in for later because ADDING it is itself the
+/// breaking change. It only ever gets more expensive: today the callers are counted, and none of
+/// them writes a literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Choice {
     /// What it is called, and what the answers give back.
     pub name: String,
@@ -163,6 +180,24 @@ pub struct Choice {
     pub suggested: bool,
     /// Tags this option needs a COMPANION to carry — see [`Choice::requires`].
     pub requires: Vec<String>,
+    /// Whether this choice belongs to the one above it: drawn indented under it, and ticked and
+    /// unticked together with it.
+    ///
+    /// Positional, like [`Choice::heading`], and for the same reason — a sub-choice FOLLOWS the
+    /// choice it belongs to, so nothing has to name a parent and two choices worded alike cannot
+    /// be confused for one another. The parent of a sub-choice is the nearest choice above it that
+    /// is not one; a run of sub-choices with no choice above them has no parent and behaves as
+    /// ordinary choices.
+    ///
+    /// The two move together in both directions. Ticking a parent ticks its sub-choices; unticking
+    /// it unticks them. Unticking any sub-choice unticks the parent, because the parent says "all
+    /// of these"; ticking the last clear one ticks the parent, for the same reason.
+    ///
+    /// A sub-choice that is not the user's to change ([`Choice::locked`]) is left alone by its
+    /// parent, and is not counted in what the parent summarises: "not yours to change" holds from
+    /// every angle, and a parent that could never be ticked because of one locked child would be a
+    /// box that does nothing.
+    pub sub: bool,
     /// Text drawn after the name, aligned into a column across the group — a status, a verdict,
     /// a remark. Display only: the name stays the answer, and nothing here reaches
     /// [`Form::answers_toml`].
@@ -186,6 +221,7 @@ impl Choice {
             tags: Vec::new(),
             suggested: false,
             requires: Vec::new(),
+            sub: false,
             note: None,
         }
     }
@@ -210,6 +246,13 @@ impl Choice {
     #[must_use]
     pub fn heading(mut self, heading: impl Into<String>) -> Self {
         self.heading = Some(heading.into());
+        self
+    }
+
+    /// Belongs to the choice above it, and is ticked with it — see [`Choice::sub`].
+    #[must_use]
+    pub fn sub(mut self) -> Self {
+        self.sub = true;
         self
     }
 
@@ -986,6 +1029,43 @@ impl Form {
             .find(|slot| self.heading_at(index, *slot).is_some())
             .unwrap_or_else(|| self.slots(index))
             .saturating_sub(1)
+    }
+
+    /// Whether slot `slot` of item `index` is a sub-choice — see [`Choice::sub`].
+    ///
+    /// Only a checkbox group can nest. A radio picks exactly one of its options, so a box covering
+    /// several of them would be picking several; a grid's rows are answers to columns of questions,
+    /// not choices that contain each other.
+    #[must_use]
+    pub fn sub_at(&self, index: usize, slot: usize) -> bool {
+        match self.items.get(index) {
+            Some(Item::Checkboxes { options, .. }) => options.get(slot).is_some_and(|o| o.sub),
+            _ => false,
+        }
+    }
+
+    /// The slot whose box covers `slot`: itself when it is an ordinary choice, and the choice it
+    /// belongs to when it is a sub-choice.
+    ///
+    /// `None` only for a sub-choice with nothing above it to belong to — a caller can write one,
+    /// and it then behaves as an ordinary choice rather than being an error worth refusing.
+    pub(crate) fn covering(&self, index: usize, slot: usize) -> Option<usize> {
+        (0..=slot).rev().find(|above| !self.sub_at(index, *above))
+    }
+
+    /// The sub-choices belonging to slot `head` — the unbroken run of them directly below it.
+    ///
+    /// Empty for a choice with none, and for a sub-choice itself: nesting is ONE level deep. Deeper
+    /// would need a tree where the API has a list, and a form deep enough to want one is a form
+    /// that wants to be several.
+    pub(crate) fn subs_of(&self, index: usize, head: usize) -> std::ops::Range<usize> {
+        if self.sub_at(index, head) {
+            return head..head;
+        }
+        let end = (head + 1..self.slots(index))
+            .find(|slot| !self.sub_at(index, *slot))
+            .unwrap_or_else(|| self.slots(index));
+        head + 1..end
     }
 
     /// Whether slot `slot` of item `index` is out of sight, folded away or filtered away.

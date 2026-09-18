@@ -406,6 +406,11 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
                         }
                     }
                 }
+                // Last, so that a mirrored twin is already in place when its own group settles.
+                // (Only the toggled group settles: a twin moved in ANOTHER group does not
+                // re-derive the box covering it, exactly as a mirrored twin already leaves
+                // `requires` and rule-greying to the next draw rather than propagating further.)
+                _settle_subs(form, item, option);
             }
         }
         Key::Char(typed) => match rows[*focus] {
@@ -860,8 +865,10 @@ pub(crate) fn compose(
                     }
                     let box_mark = _box(entry.checked, opened.ticked(index, 0, option));
                     let name = clean(entry.name.clone());
-                    let tail = _note_tail(entry, &name, widths[option], &clean);
-                    let row = format!("{box_mark} {name}");
+                    let lead = _sub_lead(form, index, option);
+                    // Measured with the lead, drawn with the lead: see `_aligned_widths`.
+                    let tail = _note_tail(entry, &format!("{lead}{name}"), widths[option], &clean);
+                    let row = format!("{lead}{box_mark} {name}");
                     // Colour BEFORE the focus mark, so that `mark`'s re-arming carries its reset
                     // through the reverse video rather than being cut short by it.
                     //
@@ -1192,6 +1199,11 @@ fn _name_widths(options: &[crate::Choice], clean: &impl Fn(String) -> String) ->
 /// looking. Slots before the first heading form a group of their own — they belong to no section,
 /// and their neighbours are each other.
 fn _aligned_widths(form: &Form, index: usize, widths: &[usize]) -> Vec<usize> {
+    // A sub-choice's indent counts toward its name, because the box and the space after it are the
+    // same width on every row: aligning the ends of indent-plus-name is what puts a nested note in
+    // the same column as its neighbours'. Every other item has no indent and is unaffected.
+    let widths: Vec<usize> =
+        (0..widths.len()).map(|s| widths[s] + _sub_lead(form, index, s).len()).collect();
     let mut aligned = vec![0; widths.len()];
     let mut start = 0;
     while start < widths.len() {
@@ -1375,6 +1387,47 @@ const GIVEN: &str = "[■]";
 /// told apart by its colour rather than its glyph.
 const TICKED: &str = "[x]";
 const CLEAR: &str = "[ ]";
+
+/// Keeps a box and the sub-choices under it agreeing, after slot `at` of item `index` was toggled.
+///
+/// The box over a run of sub-choices reads "all of these", and that one sentence settles all four
+/// directions: ticking it ticks them, clearing it clears them, and either way the box ends up
+/// saying whether all of them are ticked — so clearing any one of them clears the box, and ticking
+/// the last clear one ticks it.
+///
+/// A sub-choice that is not the user's to change is neither moved nor counted (see [`Choice::sub`]),
+/// which is also why a box whose sub-choices are ALL locked is left alone: it has nothing to
+/// summarise, and `all()` over none of them would otherwise force it on.
+fn _settle_subs(form: &mut Form, index: usize, at: usize) {
+    let Some(head) = form.covering(index, at) else { return };
+    let subs = form.subs_of(index, head);
+    // Read before the mutable borrow, the way the mirror above reads its rule-greyed slots.
+    let greyed: Vec<bool> = subs.clone().map(|s| form.ruled_out_at(index, s).is_some()).collect();
+    let Item::Checkboxes { options, .. } = &mut form.items[index] else { return };
+    let mine = |s: &usize, grey: &&bool| !**grey && options[*s].enabled;
+    let ours: Vec<usize> = subs.zip(&greyed).filter(|(s, g)| mine(s, g)).map(|(s, _)| s).collect();
+    if ours.is_empty() {
+        return;
+    }
+    if at == head {
+        let state = options[head].checked;
+        for slot in &ours {
+            options[*slot].checked = state;
+        }
+    }
+    options[head].checked = ours.iter().all(|slot| options[*slot].checked);
+}
+
+/// What a sub-choice's row starts with: the indent that puts its box under its parent's name.
+///
+/// Two spaces, the same step the focus mark and a heading use — one indent in this form means one
+/// indent everywhere in it.
+fn _sub_lead(form: &Form, index: usize, slot: usize) -> &'static str {
+    match form.sub_at(index, slot) {
+        true => "  ",
+        false => "",
+    }
+}
 
 /// The glyph for a box, from whether it is ticked now and whether it arrived that way.
 const fn _box(checked: bool, given: bool) -> &'static str {
@@ -1763,6 +1816,154 @@ mod tests {
         assert!(options[0].checked, "the one that was ticked");
         let Item::Checkboxes { options, .. } = &form.items[1] else { panic!() };
         assert!(!options[0].checked, "its locked twin stayed put");
+    }
+
+    /// A box over three sub-choices, then an ordinary choice — so the tests can show both what
+    /// the box covers and where its reach stops.
+    fn nested() -> Form {
+        let held = ["one", "two", "three"].map(|n| Choice::named(n).sub());
+        let mut options = vec![Choice::named("a pack")];
+        options.extend(held);
+        options.push(Choice::named("loose"));
+        Form::new().choices("Bundles", options)
+    }
+
+    fn ticks(form: &Form) -> Vec<bool> {
+        let Item::Checkboxes { options, .. } = &form.items[0] else { panic!() };
+        options.iter().map(|option| option.checked).collect()
+    }
+
+    /// Space on the `at`th row the cursor can REACH — not the `at`th option, once something is
+    /// disabled, and the locked-sub-choice test depends on the difference.
+    fn press(form: &mut Form, at: usize) {
+        let rows = focusables(form);
+        let mut focus = at;
+        apply(form, &rows, &mut focus, Key::Char(' '));
+    }
+
+    /// The box over a run of sub-choices reads "all of these", so ticking it ticks them and
+    /// clearing it clears them — and the choice after the run is not one of them.
+    #[test]
+    fn a_box_ticks_and_clears_everything_under_it() {
+        let mut form = nested();
+
+        press(&mut form, 0);
+        let covered = [true, true, true, true, false];
+        assert_eq!(ticks(&form), covered, "the loose choice below the run is not covered");
+
+        press(&mut form, 0);
+        assert_eq!(ticks(&form), [false; 5]);
+    }
+
+    /// The same sentence read the other way: the box says WHETHER all of them are ticked, so the
+    /// last clear one brings it on and any cleared one takes it off. No second rule is needed.
+    #[test]
+    fn the_box_follows_what_it_covers() {
+        let mut form = nested();
+
+        press(&mut form, 1);
+        let one_only = [false, true, false, false, false];
+        assert_eq!(ticks(&form), one_only, "a sub-choice covers nothing: nesting is one level");
+
+        press(&mut form, 2);
+        assert_eq!(ticks(&form), [false, true, true, false, false], "two of three is not all");
+
+        press(&mut form, 3);
+        let all = [true, true, true, true, false];
+        assert_eq!(ticks(&form), all, "the last clear one brings the box with it");
+
+        press(&mut form, 2);
+        let cleared = [false, true, false, true, false];
+        assert_eq!(ticks(&form), cleared, "and clearing one takes the box off again");
+    }
+
+    /// "Not yours to change" holds from every angle, as it does for a mirrored twin: a locked
+    /// sub-choice is not moved by the box above it, and is not part of what that box summarises
+    /// either — otherwise one locked box would make the parent impossible to tick.
+    #[test]
+    fn a_locked_sub_choice_is_neither_moved_nor_counted() {
+        let mut form = nested();
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[2].enabled = false;
+
+        press(&mut form, 0);
+        let without_it = [true, true, false, true, false];
+        assert_eq!(ticks(&form), without_it, "it stayed put, and the box is ticked without it");
+
+        press(&mut form, 1); // "one" — the cursor never lands on the locked "two"
+        let box_off = [false, false, false, true, false];
+        assert_eq!(ticks(&form), box_off, "clearing a live one clears the box, not its siblings");
+    }
+
+    /// A box whose sub-choices are ALL locked has nothing it can move and nothing to summarise, so
+    /// it is an ordinary box. Worth pinning on its own: "all of none are ticked" is true, and would
+    /// otherwise force the box back on the moment it was cleared.
+    #[test]
+    fn a_box_with_nothing_it_can_move_is_just_a_box() {
+        let held = vec![Choice::named("a pack"), Choice::named("only one").sub()];
+        let mut form = Form::new().choices("Bundles", held);
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[1].enabled = false;
+
+        press(&mut form, 0);
+        assert_eq!(ticks(&form), [true, false]);
+        press(&mut form, 0);
+        assert_eq!(ticks(&form), [false, false], "and off again, not stuck on");
+    }
+
+    /// A caller can write a sub-choice with nothing above it to belong to. That is not an error
+    /// worth refusing — it is simply a choice, and behaves as one.
+    #[test]
+    fn a_sub_choice_with_nothing_above_it_is_an_ordinary_choice() {
+        let loose = vec![Choice::named("orphan").sub(), Choice::named("another").sub()];
+        let mut form = Form::new().choices("Bundles", loose);
+
+        press(&mut form, 0);
+        assert_eq!(ticks(&form), [true, false]);
+    }
+
+    /// Ctrl+A reaches boxes without the focus list, so it is the one key that could leave a nest
+    /// disagreeing with itself. It cannot: it sets every box it may touch to the SAME state.
+    #[test]
+    fn ticking_every_box_leaves_a_nest_agreeing() {
+        let mut form = nested();
+        let rows = focusables(&form);
+        let mut focus = 0;
+
+        apply(&mut form, &rows, &mut focus, Key::Home);
+        assert_eq!(ticks(&form), [true; 5]);
+        apply(&mut form, &rows, &mut focus, Key::Home);
+        assert_eq!(ticks(&form), [false; 5]);
+    }
+
+    /// The indent is what says a choice belongs to the one above it, so the box moves right with
+    /// the name — a row whose `[ ]` is flush with its neighbours' does not read as nested.
+    #[test]
+    fn a_sub_choice_is_drawn_indented_under_the_box_that_covers_it() {
+        let lines = drawn(&nested());
+        let boxes: Vec<&str> =
+            lines.iter().filter(|l| l.contains("[ ]")).map(String::as_str).collect();
+
+        let shape = ["  [ ] a pack", "    [ ] one", "    [ ] two", "    [ ] three", "  [ ] loose"];
+        assert_eq!(boxes, shape);
+    }
+
+    /// Indenting a row moves its note two columns right along with it, which would break the one
+    /// column the notes share. The width a row is measured at includes its indent for that reason.
+    #[test]
+    fn a_nested_note_holds_the_column_its_neighbours_are_in() {
+        let rows = vec![
+            Choice::named("a pack").note("parent"),
+            Choice::named("one").sub().note("nested"),
+            Choice::named("a much longer nested name").sub().note("widest"),
+        ];
+        let lines = drawn(&Form::new().choices("Bundles", rows));
+        let column = |note: &str| {
+            lines.iter().find_map(|l| l.find(note)).unwrap_or_else(|| panic!("{lines:?}"))
+        };
+
+        assert_eq!(column("nested"), column("parent"));
+        assert_eq!(column("widest"), column("parent"));
     }
 
     /// Sub-titles draw dim above the option they belong to, and a disabled option draws dim
