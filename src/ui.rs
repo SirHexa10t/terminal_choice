@@ -1288,7 +1288,21 @@ fn _fold_lines(
             // control, and a reader learns it once. The FOOT takes a darker shade of it: a `^`
             // in the same violet as the `v` beneath it read as the next section beginning.
             let shade = if foot { FOLD_FOOT_VIOLET } else { FILTER_VIOLET };
-            let text = _style(format!("{lead}{said}")).color256(shade).to_string();
+            // And every colour the CALLER put in the heading is darkened with it, so a title
+            // carrying a price, a deadline or a phrase worth seeing echoes in its own colours
+            // rather than in one flat shade — see `_darkened`.
+            let said = if foot { _darkened(said) } else { said.to_string() };
+            // The shade is re-applied after every reset the caller closed a colour with, or the
+            // rest of the line falls back to the terminal's DEFAULT instead — which would leave
+            // the head and the foot identical over exactly the stretch the shade is there to tell
+            // apart. Done by styling each stretch between those resets rather than by writing an
+            // escape in: the styling is gated on whether stderr takes colour at all, and a raw
+            // escape here would paint a terminal that asked for none.
+            let armed: String = said
+                .split_inclusive("\x1b[0m")
+                .map(|stretch| _style(stretch).color256(shade).to_string())
+                .collect();
+            let text = format!("{}{armed}", _style(&lead).color256(shade));
             match rows.get(focus) == Some(&here) && line == 0 {
                 true => format!("{FOCUS_ON}▸ {}\x1b[0m", text.replace("\x1b[0m", "\x1b[0m\x1b[7m")),
                 false => format!("  {text}"),
@@ -1349,11 +1363,119 @@ const LOCKED_GREY: u8 = 240;
 /// has been cleared) and grey already means switched-off, so violet is what was left unclaimed.
 const FILTER_VIOLET: u8 = 141;
 
-/// The `^` closing an open section: the same hue as [`FILTER_VIOLET`], two steps darker on the
-/// 256-colour cube, so the line that ENDS a section is not mistaken for the one that begins the
-/// next. Darker rather than `dim`, because terminals disagree about what faint does to a
-/// 256-colour foreground and agree about what colour 97 is.
-const FOLD_FOOT_VIOLET: u8 = 97;
+/// The `^` closing an open section: [`FILTER_VIOLET`] darkened, so the line that ENDS a section
+/// is not mistaken for the one that begins the next. Darker rather than `dim`, because terminals
+/// disagree about what faint does to a 256-colour foreground and agree about what colour 97 is.
+///
+/// Derived rather than written down. It was the hand-picked 97 for a long time, and `_darker_256`
+/// turns 141 into exactly that — so the general rule and the chosen constant were the same number
+/// twice, which is one place for them to drift apart.
+const FOLD_FOOT_VIOLET: u8 = _darker_256(FILTER_VIOLET);
+
+/// How much darker an echoed colour is drawn: two thirds of each component.
+///
+/// Not a taste. It is the ratio this file already contained: the filter block's violet is 141 and
+/// the `^` beneath it was hand-picked as 97, which on the 256-colour cube is (3,2,5) against
+/// (2,1,3) — every component two-thirds of the original, rounded down. Applying that generally
+/// reproduces the hand-picked value, which is what makes it the rule rather than a guess.
+const DARKER: (u32, u32) = (2, 3);
+
+/// One component of a colour, darkened — a cube step, a greyscale step, or a true-colour channel.
+///
+/// One function for all three because the rule is the same in each: they differ only in how many
+/// steps the scale has, and a proportion does not care.
+const fn _darker_part(value: u8) -> u8 {
+    (value as u32 * DARKER.0 / DARKER.1) as u8
+}
+
+/// One step darker on the 256-colour palette, staying inside the family the colour came from.
+///
+/// Staying in the family is the point: a cube colour darkened into the greyscale ramp would lose
+/// its hue, and the whole job here is to be recognisably the same colour.
+const fn _darker_256(colour: u8) -> u8 {
+    match colour {
+        // The 6x6x6 cube: darken each component, which keeps the hue and drops the light.
+        16..=231 => {
+            let at = colour - 16;
+            let (r, g, b) = (at / 36, (at / 6) % 6, at % 6);
+            16 + 36 * _darker_part(r) + 6 * _darker_part(g) + _darker_part(b)
+        }
+        // The greyscale ramp is 24 steps, and darker is simply earlier along it.
+        232..=255 => 232 + _darker_part(colour - 232),
+        // The first sixteen: each bright colour has a normal twin eight below it, and the normal
+        // half is already as dark as a named colour goes.
+        8..=15 => colour - 8,
+        _ => colour,
+    }
+}
+
+/// Every colour in `text`, one step darker.
+///
+/// **A single darker shade wrapped around the line cannot do this.** A heading carries the
+/// CALLER's colours — a price, a deadline, a phrase worth seeing — and those override whatever the
+/// form wrapped around them, so the head and the foot come out identical wherever the caller
+/// painted anything. Darkening each colour where it stands keeps the heading recognisable, same
+/// hues and same emphasis, while saying plainly that this line is the echo and not the lead.
+///
+/// Foreground only, and each colour stays in the space it arrived in: a 256-colour form is still
+/// 256-colour afterwards, for a terminal that has no more. A background is the one thing on a line
+/// whose contrast a reader cannot recover if it goes wrong, and nothing here sets one.
+fn _darkened(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("\x1b[") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        // Only SGR carries colour. Anything else — a clear-line, a cursor move — is passed
+        // through untouched rather than guessed at.
+        let digits = after.len() - after.trim_start_matches(|c: char| c.is_ascii_digit() || c == ';').len();
+        if !after[digits..].starts_with('m') {
+            out.push_str("\x1b[");
+            rest = after;
+            continue;
+        }
+        out.push_str(&format!("\x1b[{}m", _darker_params(&after[..digits])));
+        rest = &after[digits + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The parameters of one SGR sequence, with any foreground colour among them darkened.
+///
+/// Walked rather than split-and-mapped because the extended forms are several fields long:
+/// `38;5;n` and `38;2;r;g;b` each carry their colour in the fields AFTER the 38, and treating
+/// those as codes in their own right would darken a number that is not a colour.
+fn _darker_params(params: &str) -> String {
+    let fields: Vec<&str> = params.split(';').collect();
+    let mut out: Vec<String> = Vec::with_capacity(fields.len());
+    let mut at = 0;
+    while at < fields.len() {
+        let darken = |field: Option<&&str>| field.and_then(|f| f.parse::<u8>().ok());
+        match (fields[at].parse::<u8>().ok(), fields.get(at + 1).copied()) {
+            (Some(38), Some("5")) if fields.len() > at + 2 => {
+                let colour = darken(fields.get(at + 2)).map_or(0, _darker_256);
+                out.push(format!("38;5;{colour}"));
+                at += 3;
+            }
+            (Some(38), Some("2")) if fields.len() > at + 4 => {
+                let channel = |n: usize| darken(fields.get(at + n)).map_or(0, _darker_part);
+                out.push(format!("38;2;{};{};{}", channel(2), channel(3), channel(4)));
+                at += 5;
+            }
+            // A bright named foreground has a normal twin sixty codes below it.
+            (Some(code @ 90..=97), _) => {
+                out.push((code - 60).to_string());
+                at += 1;
+            }
+            _ => {
+                out.push(fields[at].to_owned());
+                at += 1;
+            }
+        }
+    }
+    out.join(";")
+}
 
 /// The blue a suggested tick is drawn in — 256-colour, as above.
 ///
@@ -2101,6 +2223,89 @@ mod tests {
             "{lines:#?}"
         );
         assert_eq!((at("v web"), at("^ web")), (Some(5), Some(8)), "{lines:#?}");
+    }
+
+    /// The rule and the hand-picked constant were the same number twice, and this is the pairing
+    /// that let it be written once. 141 on the cube is (3,2,5); two-thirds of each component,
+    /// rounded down, is (2,1,3), which is 97 — the value `FOLD_FOOT_VIOLET` was for a long time.
+    #[test]
+    fn the_foot_shade_is_the_head_shade_darkened_and_lands_where_it_was_chosen_by_hand() {
+        assert_eq!(FILTER_VIOLET, 141);
+        assert_eq!(FOLD_FOOT_VIOLET, 97);
+        assert_eq!(_darker_256(FILTER_VIOLET), FOLD_FOOT_VIOLET);
+    }
+
+    /// Each family of the 256-colour palette darkens within itself. A cube colour that fell into
+    /// the greyscale ramp would lose the hue, and being recognisably the same colour is the job.
+    #[test]
+    fn a_palette_colour_darkens_without_leaving_its_own_family() {
+        // The cube: 16 is (0,0,0) and already the darkest; 231 is (5,5,5) and becomes (3,3,3).
+        assert_eq!(_darker_256(16), 16);
+        assert_eq!(_darker_256(231), 16 + 36 * 3 + 6 * 3 + 3);
+        assert!((16..=231).contains(&_darker_256(200)), "still on the cube");
+        // The greyscale ramp stays on the ramp, and the darkest step stays put.
+        assert_eq!(_darker_256(255), 232 + 15);
+        assert_eq!(_darker_256(232), 232);
+        // The first sixteen: a bright colour has a normal twin eight below, and normal is the end.
+        assert_eq!(_darker_256(9), 1);
+        assert_eq!(_darker_256(1), 1);
+    }
+
+    /// The whole reason a single darker shade was not enough: a heading carries the CALLER's
+    /// colours, and those override anything wrapped around them.
+    #[test]
+    fn every_colour_in_a_line_is_darkened_where_it_stands() {
+        // True colour, 256-colour and a bright named colour, with plain text between them.
+        let painted = format!(
+            "{}green{} plain {}violet{} {}bright{}",
+            "\x1b[38;2;76;166;76m", "\x1b[0m", "\x1b[38;5;141m", "\x1b[0m", "\x1b[93m", "\x1b[0m"
+        );
+        let darker = _darkened(&painted);
+
+        assert!(darker.contains("\x1b[38;2;50;110;50m"), "{darker:?}");
+        assert!(darker.contains("\x1b[38;5;97m"), "{darker:?}");
+        assert!(darker.contains("\x1b[33m"), "{darker:?}");
+        // The words are untouched, and so is everything that was not a colour.
+        assert_eq!(console::strip_ansi_codes(&darker), console::strip_ansi_codes(&painted));
+        assert!(darker.contains("\x1b[0m"), "the resets survive: {darker:?}");
+    }
+
+    /// Foreground only, and only SGR. A background is the one thing on a line whose contrast a
+    /// reader cannot get back, and a cursor move is not a colour to be reinterpreted.
+    #[test]
+    fn a_background_and_a_non_colour_sequence_are_left_exactly_as_they_were() {
+        let untouched = "\x1b[48;2;10;20;30mbackground\x1b[0m\x1b[Ktail\x1b[7mreversed";
+        assert_eq!(_darkened(untouched), untouched);
+    }
+
+    /// End to end, which is what the reader actually sees: the `^` line repeats the heading in
+    /// darker versions of its own colours rather than in one flat shade.
+    #[test]
+    fn a_foot_echoes_a_coloured_heading_one_shade_darker() {
+        let painted = format!("{}Bundle{} then plain", "\x1b[38;2;76;166;76m", "\x1b[0m");
+        let mut form = Form::new().checkboxes("x", &["a"]).collapsible();
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].heading = Some(painted);
+
+        let rows = focusables(&form);
+        let frame = render(&form, &rows, rows.len() - 1, 200, &[], &Opened::of(&form));
+        let line = |mark: char| {
+            frame.iter().find(|line| console::strip_ansi_codes(line).trim_start().starts_with(mark))
+        };
+        let head = line(OPEN).expect("an open marker").clone();
+        let foot = line(CLOSE).expect("a closing marker").clone();
+
+        // The caller's own green, darkened in the foot and not in the head. Asserted on the
+        // CALLER's colours because those are in the heading string itself and reach the frame
+        // whatever the terminal takes; the form's own shade is gated on stderr accepting colour,
+        // which `styling_follows_stderr_and_not_a_redirected_stdout` is the test for.
+        assert!(head.contains("\x1b[38;2;76;166;76m"), "{head:?}");
+        assert!(!head.contains("\x1b[38;2;50;110;50m"), "{head:?}");
+        assert!(foot.contains("\x1b[38;2;50;110;50m"), "{foot:?}");
+        assert!(!foot.contains("\x1b[38;2;76;166;76m"), "{foot:?}");
+        // Same words on both, so only the colours tell them apart.
+        let said = |line: &str| console::strip_ansi_codes(line).trim().to_string();
+        assert_eq!(said(&head)[1..], said(&foot)[1..], "{head:?} / {foot:?}");
     }
 
     /// And a shut one: `>`, nothing beneath it, and no `^` — there is nothing to close.
