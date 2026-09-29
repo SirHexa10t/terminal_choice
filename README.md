@@ -73,6 +73,12 @@ Size = "L"
 Toppings = ["olives", "feta"]
 ```
 
+A group can carry **comment rows** of its own — `Choice::comment("# about these")` in an option's
+slot. One is drawn as a comment is drawn, dim and boxless, but INSIDE the group: the cursor skips
+it, it is never an answer, and it folds away with its section, so it can say something about one
+section's options that a reader who folded that section will not see. (A form-level `.comment`
+sits between groups and is always visible.)
+
 Text fields and checkbox groups always appear (an empty array means "asked, none apply"); a radio
 nobody picked is omitted. Exit codes: `0` submitted, `1` cancelled (nothing printed), `2` the
 form, file, or terminal was unusable.

@@ -148,7 +148,9 @@ pub(crate) fn focusables(form: &Form) -> Vec<Focus> {
                     rows.extend(_fold_stop(form, index, option));
                     // Greyed by an incompatibility gets no row either, and for the same reason
                     // a disabled one does not: the cursor cannot reach what does not exist here.
+                    // A comment row gets no row here either, which is all "unselectable" means.
                     if entry.enabled
+                        && !entry.comment
                         && !form.hidden(index, option)
                         && form.ruled_out_at(index, option).is_none()
                     {
@@ -238,7 +240,9 @@ pub(crate) fn apply(form: &mut Form, rows: &[Focus], focus: &mut usize, key: Key
                 for (index, item) in form.items.iter().enumerate() {
                     if let Item::Checkboxes { options, .. } = item {
                         for (option, entry) in options.iter().enumerate() {
-                            if entry.enabled && form.ruled_out_at(index, option).is_none() {
+                            // Reached without the focus list, so the comment skip is repeated
+                            // here: a comment has nothing to tick, and "all" cannot mean it.
+                            if entry.enabled && !entry.comment && form.ruled_out_at(index, option).is_none() {
                                 live.push((index, option, entry.checked));
                             }
                         }
@@ -709,6 +713,106 @@ impl Drop for RawMode {
     }
 }
 
+/// Mouse reporting for the run: button events only, in the SGR encoding.
+///
+/// **Needed for the wheel to work at all, not decorative.** The form repaints in place — no
+/// alternate screen — by moving the cursor back over the lines it drew. A terminal left to handle
+/// the wheel itself scrolls that region out from under the arithmetic, and the next repaint lands
+/// on the wrong lines. Claiming the mouse keeps the terminal still; the events it then sends are
+/// the form's to act on. `?1000h` reports presses, releases and wheel turns and NOT pointer
+/// motion — motion arrives as a stream at every twitch, which is the junk `apply` already refuses
+/// — and `?1006h` picks the SGR encoding, whose reports are plain digits ending in `M`/`m` and so
+/// survive any terminal size.
+///
+/// Written through the same stderr `Term` the form draws on, and undone on every path out of the
+/// run by the drop: a form that panicked or was cancelled must not leave the shell's mouse
+/// stolen.
+pub(crate) struct MouseCapture {
+    term: Term,
+}
+
+impl MouseCapture {
+    const ON: &'static str = "\x1b[?1000h\x1b[?1006h";
+    const OFF: &'static str = "\x1b[?1006l\x1b[?1000l";
+
+    pub(crate) fn engage(term: &Term) -> std::io::Result<Self> {
+        term.write_str(Self::ON)?;
+        term.flush()?;
+        Ok(Self { term: term.clone() })
+    }
+}
+
+impl Drop for MouseCapture {
+    fn drop(&mut self) {
+        let _ = self.term.write_str(Self::OFF);
+        let _ = self.term.flush();
+    }
+}
+
+/// Rows the cursor moves per wheel notch.
+///
+/// Three, because that is what a terminal itself scrolls its buffer by per notch on the platforms
+/// this runs on, so the form's wheel feels like every other wheel. Moving the CURSOR rather than
+/// the viewport keeps every invariant the keys already hold — the row under the cursor is always
+/// on screen, and Space acts on what is highlighted — at the cost that a wheel cannot look at the
+/// top of a long form while the cursor stays at the bottom. That is the keyboard's rule too.
+const WHEEL_STEP: usize = 3;
+
+/// The cursor's row after a wheel notch: three rows on, stopping at the ends rather than wrapping.
+///
+/// The arrows wrap because a key held down should come round; a wheel that jumped from the last
+/// row to the first would look like the form losing its place.
+fn _wheel_target(rows: usize, focus: usize, down: bool) -> usize {
+    match (rows, down) {
+        (0, _) => 0,
+        (_, true) => (focus + WHEEL_STEP).min(rows - 1),
+        (_, false) => focus.saturating_sub(WHEEL_STEP),
+    }
+}
+
+/// Whether an unknown escape is the start of an SGR mouse report: `ESC [ <` and then digits.
+fn _is_mouse_report(seq: &[char]) -> bool {
+    seq.len() >= 2 && seq[0] == '[' && seq[1] == '<'
+}
+
+/// The rest of a mouse report `console` did not read, appended to the part it did.
+///
+/// `console` reads at most three characters after an escape it does not recognise, and a report
+/// is longer — `<65;12;7M` — so the tail is still in the terminal's buffer, one character per
+/// byte, and would arrive as ordinary keystrokes: junk over a checkbox, TYPED into a text field.
+/// This drains it up to the `M`/`m` that ends every report, without blocking: a report cut short
+/// by a slow terminal is dropped rather than waited for.
+fn _finish_mouse_report(fd: std::os::fd::RawFd, seq: &[char]) -> String {
+    let mut report: String = seq.iter().skip(2).collect();
+    // Longer than any report: three numbers of at most five digits, two separators, one letter.
+    while report.len() < 24 && !report.ends_with(['M', 'm']) && _input_pending(fd) {
+        let mut byte = 0u8;
+        // SAFETY: reads one byte into a local the call cannot outlive, from the terminal this
+        // form already polls and reads through `console`.
+        let got = unsafe { libc::read(fd, std::ptr::from_mut(&mut byte).cast(), 1) };
+        if got != 1 {
+            break;
+        }
+        report.push(char::from(byte));
+    }
+    report
+}
+
+/// Which way a wheel report turned — `Some(true)` down, `Some(false)` up — or `None` for a report
+/// that is not a wheel turn at all: a click, a release, a report cut short.
+///
+/// The button code is the first number: 64 up and 65 down in every terminal that speaks SGR.
+fn _wheel_direction(report: &str) -> Option<bool> {
+    if !report.ends_with(['M', 'm']) {
+        return None;
+    }
+    match report.split(';').next()?.parse::<u32>().ok()? {
+        64 => Some(false),
+        65 => Some(true),
+        _ => None,
+    }
+}
+
 /// Sleep until the terminal has input (or is gone). `Ok(true)`: a key is waiting, and
 /// `Term::read_key` will return without ever reaching its zero-timeout polling. `Ok(false)`:
 /// hangup — the terminal went away, which a caller should read as cancellation rather than
@@ -863,6 +967,11 @@ pub(crate) fn compose(
                         lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
                         continue;
                     }
+                    if entry.comment {
+                        lines.extend(_comment_rows(&entry.name, comment_indent, &clean));
+                        lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
+                        continue;
+                    }
                     let box_mark = _box(entry.checked, opened.ticked(index, 0, option));
                     let name = clean(entry.name.clone());
                     let lead = _sub_lead(form, index, option);
@@ -911,6 +1020,11 @@ pub(crate) fn compose(
                         false => lines.extend(subtitle(&entry.heading, comment_indent, &clean)),
                     }
                     if form.hidden(index, option) {
+                        lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
+                        continue;
+                    }
+                    if entry.comment {
+                        lines.extend(_comment_rows(&entry.name, comment_indent, &clean));
                         lines.extend(_fold_lines(form, index, option, true, rows, focus, &clean));
                         continue;
                     }
@@ -1187,7 +1301,23 @@ const MIN_BODY: usize = 3;
 
 /// Each choice's name width as drawn — the raw material [`_aligned_widths`] turns into columns.
 fn _name_widths(options: &[crate::Choice], clean: &impl Fn(String) -> String) -> Vec<usize> {
-    options.iter().map(|entry| console::measure_text_width(&clean(entry.name.clone()))).collect()
+    // A comment row has no box and no column to align: its text is as wide as it is, and
+    // counting it would push every note in the section past the end of the longest sentence.
+    options
+        .iter()
+        .map(|entry| match entry.comment {
+            true => 0,
+            false => console::measure_text_width(&clean(entry.name.clone())),
+        })
+        .collect()
+}
+
+/// A comment row inside a group, as rendered lines: dim, indented like an [`Item::Comment`], one
+/// line per line of text — the same drawing, in an option's slot.
+fn _comment_rows(text: &str, indent: &str, clean: &impl Fn(String) -> String) -> Vec<String> {
+    text.lines()
+        .map(|line| _style(format!("{indent}{}", clean(line.to_string()))).dim().to_string())
+        .collect()
 }
 
 /// The column width each slot of item `index` aligns its trailing text to: the widest of its OWN
@@ -1526,7 +1656,7 @@ fn _settle_subs(form: &mut Form, index: usize, at: usize) {
     // Read before the mutable borrow, the way the mirror above reads its rule-greyed slots.
     let greyed: Vec<bool> = subs.clone().map(|s| form.ruled_out_at(index, s).is_some()).collect();
     let Item::Checkboxes { options, .. } = &mut form.items[index] else { return };
-    let mine = |s: &usize, grey: &&bool| !**grey && options[*s].enabled;
+    let mine = |s: &usize, grey: &&bool| !**grey && options[*s].enabled && !options[*s].comment;
     let ours: Vec<usize> = subs.zip(&greyed).filter(|(s, g)| mine(s, g)).map(|(s, _)| s).collect();
     if ours.is_empty() {
         return;
@@ -1678,6 +1808,9 @@ pub fn run_with_warnings(
     let (fd, _tty_handle) = _input_fd()?;
     // Raw for the whole run (drops — and restores — on every path out of this function).
     let _raw = RawMode::engage(fd)?;
+    // Declared after the raw guard so it drops FIRST: the mouse is released while the terminal is
+    // still in the state it was claimed in.
+    let _mouse = MouseCapture::engage(&term)?;
     term.hide_cursor()?;
     term.flush()?;
     let outcome = loop {
@@ -1713,6 +1846,20 @@ pub fn run_with_warnings(
             match term.read_key() {
                 // The terminal went away mid-question (hangup, ctrl-d): treat as walking off.
                 Err(_) => break Action::Cancel,
+                // A mouse report, before `apply` sees it as junk: a wheel turn moves the cursor,
+                // anything else (a click, a release) is drained and dropped.
+                Ok(Key::UnknownEscSeq(ref seq)) if _is_mouse_report(seq) => {
+                    let report = _finish_mouse_report(fd, seq);
+                    let Some(down) = _wheel_direction(&report) else { continue };
+                    let live = focusables(form);
+                    focus = _wheel_target(live.len(), focus.min(live.len().saturating_sub(1)), down);
+                    drained += 1;
+                    // A spin sends one report per notch; like a held key, the burst paints once.
+                    if _coalesce(&Action::Redraw, _input_pending(fd), drained) {
+                        continue;
+                    }
+                    break Action::Redraw;
+                }
                 Ok(key) => {
                     // Taken fresh per KEY, not per frame: while several keys are being folded
                     // into one repaint, any of them may fold a section and change what rows
@@ -1762,6 +1909,129 @@ mod tests {
             .checkboxes("Tops", &["a", "b"])
             .radio("Size", &["S", "M"])
             .text("Name", "")
+    }
+
+    /// A group whose middle row is a comment: what a bundle's URL line looks like from the crate's
+    /// side, with a tickable option on either side of it.
+    fn commented() -> Form {
+        let mut form = Form::new().checkboxes("Games", &["first", "third"]);
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options.insert(1, Choice::comment("# https://example.test/bundle"));
+        form
+    }
+
+    /// Unselectable means exactly what it means for a disabled row: no row in the focus list, so
+    /// no key can ever name it.
+    #[test]
+    fn a_comment_row_is_never_a_stop_for_the_cursor() {
+        let form = commented();
+        let rows = focusables(&form);
+        assert_eq!(
+            rows,
+            vec![Focus::Option { item: 0, option: 0 }, Focus::Option { item: 0, option: 2 }, Focus::Submit],
+            "the comment at slot 1 has no row: {rows:?}"
+        );
+    }
+
+    /// Drawn as a comment is drawn — dim, indented, no box — in the slot it occupies.
+    #[test]
+    fn a_comment_row_draws_dim_and_boxless_between_its_neighbours() {
+        let form = commented();
+        let rows = focusables(&form);
+        let frame = compose(&form, &rows, 0, 80, &[], &Opened::of(&form));
+        let at = frame.lines.iter().position(|l| l.contains("example.test")).expect("the comment is drawn");
+        assert!(!frame.lines[at].contains("[ ]") && !frame.lines[at].contains("[x]"), "{:?}", frame.lines[at]);
+        assert!(frame.lines[at - 1].contains("first"), "it sits after the first option: {:?}", frame.lines);
+        assert!(frame.lines[at + 1].contains("third"), "and before the last: {:?}", frame.lines);
+    }
+
+    /// Never an answer: it cannot be ticked by the user (no row), by a parent (not a sub), or
+    /// by select-all — and the answers it is not part of are exactly the options around it.
+    #[test]
+    fn a_comment_row_is_never_an_answer() {
+        let mut form = commented();
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options[0].checked = true;
+        options[2].checked = true;
+        assert_eq!(form.checked("Games"), vec!["first", "third"]);
+        assert!(!form.comment_at(0, 0) && form.comment_at(0, 1) && !form.comment_at(0, 2));
+    }
+
+    /// A comment standing above a run of sub-choices is not their parent: it has no box to
+    /// summarise them into, so the run behaves as ordinary choices, exactly as a run with nothing
+    /// above it does.
+    #[test]
+    fn a_comment_row_cannot_be_the_parent_of_sub_choices() {
+        let mut form = Form::new().checkboxes("Pack", &["a", "b"]);
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options.insert(0, Choice::comment("about the pack"));
+        options[1].sub = true;
+        options[2].sub = true;
+        assert_eq!(form.covering(0, 1), None, "no parent above the run but a comment");
+        assert_eq!(form.covering(0, 2), None);
+    }
+
+    /// Folded away with its section: the whole point of a comment INSIDE a group is that it is
+    /// about that section, and shows and hides with it.
+    #[test]
+    fn a_comment_row_is_folded_away_with_its_section() {
+        let mut form = Form::new().checkboxes("Games", &["first", "third"]).collapsible();
+        let Item::Checkboxes { options, .. } = &mut form.items[0] else { panic!() };
+        options.insert(0, Choice::comment("# https://example.test/bundle"));
+        options[0].heading = Some("A bundle".into());
+        let open = compose(&form, &focusables(&form), 0, 80, &[], &Opened::of(&form));
+        assert!(open.lines.iter().any(|l| l.contains("example.test")), "shown while open: {:?}", open.lines);
+        let form = form.all_folded();
+        let shut = compose(&form, &focusables(&form), 0, 80, &[], &Opened::of(&form));
+        assert!(!shut.lines.iter().any(|l| l.contains("example.test")), "hidden when shut: {:?}", shut.lines);
+        assert!(shut.lines.iter().any(|l| l.contains("A bundle")), "the title still stands: {:?}", shut.lines);
+    }
+
+    /// The column that notes align to ignores a comment's width, or one long sentence would push
+    /// every note in the section off to the right of it.
+    #[test]
+    fn a_comment_rows_width_does_not_set_the_note_column() {
+        let widths = _name_widths(
+            &[Choice::named("ab"), Choice::comment("a much longer line of commentary"), Choice::named("cd")],
+            &|s| s,
+        );
+        assert_eq!(widths, vec![2, 0, 2]);
+    }
+
+    /// Select-all reaches boxes without the focus list, so it is the one key that could tick a
+    /// comment row; it must not.
+    #[test]
+    fn select_all_ticks_around_a_comment_row() {
+        let mut form = commented();
+        let rows = focusables(&form);
+        let mut focus = 0;
+        apply(&mut form, &rows, &mut focus, Key::Home);
+        assert_eq!(form.checked("Games"), vec!["first", "third"]);
+        let Item::Checkboxes { options, .. } = &form.items[0] else { panic!() };
+        assert!(!options[1].checked, "the comment row stays clear: {options:?}");
+    }
+
+    /// A wheel report is read off its button code, and only a whole report counts.
+    #[test]
+    fn a_wheel_report_is_read_off_its_button() {
+        assert_eq!(_wheel_direction("65;12;7M"), Some(true), "button 65 is wheel-down");
+        assert_eq!(_wheel_direction("64;1;1M"), Some(false), "button 64 is wheel-up");
+        assert_eq!(_wheel_direction("0;5;5M"), None, "a press is not a wheel turn");
+        assert_eq!(_wheel_direction("0;5;5m"), None, "nor a release");
+        assert_eq!(_wheel_direction("65;12"), None, "a report cut short is dropped");
+        assert_eq!(_wheel_direction(""), None);
+        assert!(_is_mouse_report(&['[', '<', '6']) && !_is_mouse_report(&['[', 'Z']));
+    }
+
+    /// Three rows a notch, stopping at either end rather than wrapping.
+    #[test]
+    fn the_wheel_moves_three_rows_and_stops_at_the_ends() {
+        assert_eq!(_wheel_target(10, 0, true), 3);
+        assert_eq!(_wheel_target(10, 8, true), 9, "clamped to the last row");
+        assert_eq!(_wheel_target(10, 9, true), 9, "and stays there");
+        assert_eq!(_wheel_target(10, 4, false), 1);
+        assert_eq!(_wheel_target(10, 1, false), 0, "clamped to the first");
+        assert_eq!(_wheel_target(0, 0, true), 0, "a form with no rows has nowhere to go");
     }
 
     /// The two doors compose: what a definition declared, then what this run's caller adds. A

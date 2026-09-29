@@ -198,6 +198,15 @@ pub struct Choice {
     /// every angle, and a parent that could never be ticked because of one locked child would be a
     /// box that does nothing.
     pub sub: bool,
+    /// A line of text standing INSIDE a group, in an option's slot: drawn dim like a comment,
+    /// never a stop for the cursor, never an answer, and folded away with the section it sits in.
+    ///
+    /// What [`Item::Comment`] cannot do, because an item sits between groups: say something about
+    /// the options of ONE section, where a reader opening that section will see it and a reader
+    /// who folded it will not. The `name` carries the text; `checked` stays false, and every walk
+    /// that ticks, counts or aligns options skips it. A caller pairing answers with what it
+    /// offered must skip it the same way — it occupies a slot and answers nothing.
+    pub comment: bool,
     /// Text drawn after the name, aligned into a column across the group — a status, a verdict,
     /// a remark. Display only: the name stays the answer, and nothing here reaches
     /// [`Form::answers_toml`].
@@ -223,6 +232,7 @@ impl Choice {
             requires: Vec::new(),
             sub: false,
             note: None,
+            comment: false,
         }
     }
 
@@ -247,6 +257,12 @@ impl Choice {
     pub fn heading(mut self, heading: impl Into<String>) -> Self {
         self.heading = Some(heading.into());
         self
+    }
+
+    /// Display-only text inside a group — see [`Choice::comment`].
+    #[must_use]
+    pub fn comment(text: impl Into<String>) -> Self {
+        Self { comment: true, ..Self::named(text) }
     }
 
     /// Belongs to the choice above it, and is ticked with it — see [`Choice::sub`].
@@ -784,6 +800,11 @@ impl Form {
         if self.excluded.is_empty() {
             return false;
         }
+        // A comment row follows its section rather than its own (empty) tags: it is filtered
+        // away exactly when everything it was commenting on is, and never on its own account.
+        if self.comment_at(index, slot) {
+            return self.section_head(index, slot).is_some_and(|head| self.section_emptied(index, head));
+        }
         let tags = self.tags_at(index, slot);
         self.filter_boxes()
             .filter(|rule| self.excluded.contains(&rule.label))
@@ -1049,8 +1070,17 @@ impl Form {
     ///
     /// `None` only for a sub-choice with nothing above it to belong to — a caller can write one,
     /// and it then behaves as an ordinary choice rather than being an error worth refusing.
+    /// Whether slot `slot` of item `index` is a comment row — see [`Choice::comment`].
+    pub fn comment_at(&self, index: usize, slot: usize) -> bool {
+        match self.items.get(index) {
+            Some(Item::Checkboxes { options, .. } | Item::Radio { options, .. }) => options.get(slot).is_some_and(|o| o.comment),
+            _ => false,
+        }
+    }
+
     pub(crate) fn covering(&self, index: usize, slot: usize) -> Option<usize> {
-        (0..=slot).rev().find(|above| !self.sub_at(index, *above))
+        // A comment cannot be a parent: it has no box for the sub-choices to summarise into.
+        (0..=slot).rev().find(|above| !self.sub_at(index, *above) && !self.comment_at(index, *above))
     }
 
     /// The sub-choices belonging to slot `head` — the unbroken run of them directly below it.
@@ -1087,8 +1117,11 @@ impl Form {
     /// the screen with headings over nothing, which is the opposite of what a filter is for —
     /// and folding an empty section is a control that does nothing.
     pub(crate) fn section_emptied(&self, index: usize, head: usize) -> bool {
+        // Comment rows are not counted: a section whose every OPTION is filtered away is empty,
+        // whatever it says about itself.
         self.filter_boxes().next().is_some()
             && (head..=self.section_tail(index, head))
+                .filter(|slot| !self.comment_at(index, *slot))
                 .all(|slot| self.filtered_out(index, slot))
     }
 

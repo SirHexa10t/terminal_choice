@@ -40,6 +40,7 @@ impl Choices {
                 requires: Vec::new(),
                 sub: false,
                 note: None,
+                comment: false,
             })
             .collect()
     }
