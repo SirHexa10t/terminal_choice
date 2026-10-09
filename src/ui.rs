@@ -1368,6 +1368,13 @@ const SHUT: char = '>';
 const OPEN: char = 'v';
 const CLOSE: char = '^';
 
+/// What stands between a FOOT's `^` and its title — `^ --- web` rather than `^ web` — so a line
+/// that closes a section cannot be read as one that opens the next. The foot already takes a darker
+/// violet than the head beneath it, and that was not enough on its own: colour is the first thing a
+/// terminal without it, or a reader not looking for it, loses. A rule is visible in plain text.
+/// Only the foot carries it; a head is a control the cursor lands on and keeps the plain `v `.
+const FOOT_RULE: &str = " --- ";
+
 /// The fold row before or after slot `slot`, drawn — or nothing, which is the usual answer.
 ///
 /// Mirrors [`_folds`] exactly, and must: a marker drawn where no focus row exists could never be
@@ -1409,8 +1416,9 @@ fn _fold_lines(
     body.into_iter()
         .enumerate()
         .map(|(line, said)| {
-            let lead = match line {
-                0 => format!("{arrow} "),
+            let lead = match (line, foot) {
+                (0, true) => format!("{arrow}{FOOT_RULE}"),
+                (0, false) => format!("{arrow} "),
                 _ => "  ".to_string(),
             };
             // The filter block's violet, because a fold title does the filter block's job: both
@@ -2488,11 +2496,11 @@ mod tests {
         let lines = drawn(&sectioned().collapsible());
         let at = |want: &str| lines.iter().position(|line| line.trim() == want);
         assert_eq!(
-            (at("v dev"), at("[ ] git"), at("[■] jq"), at("^ dev")),
+            (at("v dev"), at("[ ] git"), at("[■] jq"), at("^ --- dev")),
             (Some(1), Some(2), Some(3), Some(4)),
             "{lines:#?}"
         );
-        assert_eq!((at("v web"), at("^ web")), (Some(5), Some(8)), "{lines:#?}");
+        assert_eq!((at("v web"), at("^ --- web")), (Some(5), Some(8)), "{lines:#?}");
     }
 
     /// The rule and the hand-picked constant were the same number twice, and this is the pairing
@@ -2573,9 +2581,16 @@ mod tests {
         assert!(!head.contains("\x1b[38;2;50;110;50m"), "{head:?}");
         assert!(foot.contains("\x1b[38;2;50;110;50m"), "{foot:?}");
         assert!(!foot.contains("\x1b[38;2;76;166;76m"), "{foot:?}");
-        // Same words on both, so only the colours tell them apart.
+        // The same TITLE on both — the foot restates which section just ended — but no longer the
+        // same line: the foot's title sits behind the rule, so a closing line cannot be read as the
+        // next one opening. Compared after each one's own lead.
         let said = |line: &str| console::strip_ansi_codes(line).trim().to_string();
-        assert_eq!(said(&head)[1..], said(&foot)[1..], "{head:?} / {foot:?}");
+        let (head, foot) = (said(&head), said(&foot));
+        assert_eq!(
+            foot.strip_prefix(&format!("{CLOSE}{FOOT_RULE}")),
+            head.strip_prefix(&format!("{OPEN} ")),
+            "{head:?} / {foot:?}"
+        );
     }
 
     /// And a shut one: `>`, nothing beneath it, and no `^` — there is nothing to close.
@@ -2586,7 +2601,7 @@ mod tests {
         assert!(lines.iter().any(|line| line.trim() == "> dev"), "{lines:#?}");
         assert!(!lines.iter().any(|line| line.contains("git")), "folded away: {lines:#?}");
         assert!(!lines.iter().any(|line| line.contains("jq")), "folded away: {lines:#?}");
-        assert!(!lines.iter().any(|line| line.trim() == "^ dev"), "nothing to close: {lines:#?}");
+        assert!(!lines.iter().any(|line| line.trim() == "^ --- dev"), "nothing to close: {lines:#?}");
         // The other section is untouched — folding is per-section, not per-form.
         assert!(lines.iter().any(|line| line.trim() == "v web"), "{lines:#?}");
         assert!(lines.iter().any(|line| line.contains("brave")), "{lines:#?}");
@@ -2673,7 +2688,7 @@ mod tests {
             .map(|line| console::strip_ansi_codes(line).trim().to_string())
             .collect();
         assert!(shown.iter().any(|line| line.starts_with("v ")), "the title is drawn: {shown:#?}");
-        assert!(shown.iter().any(|line| line.starts_with("^ ")), "and so is the closing line");
+        assert!(shown.iter().any(|line| line.starts_with("^ --- ")), "and so is the closing line");
 
         let mut focus = rows.iter().position(|row| *row == Focus::Option { item: 0, option: 1 }).unwrap();
         apply(&mut form, &rows, &mut focus, Key::ArrowDown);
@@ -2731,7 +2746,7 @@ mod tests {
         let form = grid_form().collapsible();
         let lines = drawn(&form);
         assert!(lines.iter().any(|line| line.trim() == "v # tools"), "{lines:#?}");
-        assert!(lines.iter().any(|line| line.trim() == "^ # tools"), "{lines:#?}");
+        assert!(lines.iter().any(|line| line.trim() == "^ --- # tools"), "{lines:#?}");
 
         let form = grid_form().collapsible().folded(0, 1); // "# browsers", covering rows 1 and 2
         let lines = drawn(&form);
@@ -2754,7 +2769,7 @@ mod tests {
         let lines = drawn(&form);
         assert_eq!(
             lines.iter().map(|line| line.trim()).take(5).collect::<Vec<_>>(),
-            ["p:", "v first", "second", "[ ] a", "^ first"],
+            ["p:", "v first", "second", "[ ] a", "^ --- first"],
             "the head carries both lines and one arrow; the foot names the section and stops"
         );
         let marked = |arrow: char| {
@@ -2795,7 +2810,7 @@ mod tests {
                 "  v File managers",
                 "  apt  flatpak",
                 "  [ ]  [ ]      nautilus",
-                "  ^ File managers",
+                "  ^ --- File managers",
                 "",
                 "▸ [ Submit ]",
                 "↑/↓/←/→ move · space picks · ctrl+a all/none · ctrl+s submit · tab fold/unfold · enter next/submit · esc cancels",
@@ -4377,7 +4392,7 @@ mod tests {
             lines.iter().find(|line| console::strip_ansi_codes(line).trim() == want).expect("drawn").clone()
         };
         assert_eq!(line("v one"), format!("  {}", violet("v one")), "an open section's head");
-        assert_eq!(line("^ one"), format!("  {}", violet("^ one")), "and its foot");
+        assert_eq!(line("^ --- one"), format!("  {}", violet("^ --- one")), "and its foot, behind the rule");
         assert_eq!(line("> two"), format!("  {}", violet("> two")), "a shut one");
         assert_eq!(line("[ ]  a").trim_start(), "[ ]  a", "the entries themselves stay plain");
     }
