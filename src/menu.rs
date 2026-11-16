@@ -34,12 +34,15 @@ pub struct Menu {
     pub typed: String,
     /// Why the last Enter was refused. Shown until the next key, then gone.
     pub refused: Option<String>,
+    /// Whether the first pick is numbered 0 — see [`Menu::zeroth`].
+    pub zeroth: bool,
 }
 
 /// How a menu ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chosen {
-    /// The index into [`Menu::picks`] — not the number typed, which is one higher.
+    /// The index into [`Menu::picks`] — not the number typed, which is one higher (unless the menu
+    /// has a [`Menu::zeroth`] pick: then each number is its pick's index).
     Picked(usize),
     Cancelled,
 }
@@ -79,25 +82,52 @@ impl Menu {
         self
     }
 
+    /// An option numbered 0, shown first, whenever it is added: the one that stands apart from the
+    /// list — a new item, beside the existing ones — and so keeps its number however long the list
+    /// grows. The rest keep theirs, from 1, and each number is then its pick's index. A second
+    /// call replaces the first's.
+    #[must_use]
+    pub fn zeroth(mut self, label: impl Into<String>) -> Self {
+        let pick = Pick { label: label.into(), locked: None };
+        if self.zeroth {
+            self.picks[0] = pick;
+        } else {
+            self.picks.insert(0, pick);
+            self.zeroth = true;
+        }
+        self
+    }
+
     /// What Enter would do with what has been typed: the index picked, or why not.
     ///
     /// Numbers are one-based on screen and the answer is zero-based, because the screen is for a
-    /// person and the index is for `picks[]` — and a menu that showed `0)` would look broken.
+    /// person and the index is for `picks[]` — and a menu that showed `0)` would look broken. A
+    /// [`Menu::zeroth`] pick is the exception: set apart from the list, it is numbered 0, and the
+    /// numbers are then the indexes.
     pub fn answer(&self) -> Result<usize, String> {
-        let shown = self.picks.len();
         let Ok(number) = self.typed.parse::<usize>() else {
             return Err("type a number".to_string());
         };
-        match number.checked_sub(1).and_then(|at| self.picks.get(at).map(|pick| (at, pick))) {
-            None => Err(format!("there is no {number} — pick 1 to {shown}")),
+        match number.checked_sub(self.first_number()).and_then(|at| self.picks.get(at).map(|pick| (at, pick))) {
+            None => Err(format!("there is no {number} — pick {} to {}", self.first_number(), self.last_number())),
             Some((_, Pick { locked: Some(why), .. })) => Err(format!("{number} is not on offer yet — {why}")),
             Some((at, _)) => Ok(at),
         }
     }
 
+    /// The number the first pick shows: 1 — or 0, for a [`Menu::zeroth`] pick.
+    fn first_number(&self) -> usize {
+        usize::from(!self.zeroth)
+    }
+
+    /// The number the last pick shows.
+    fn last_number(&self) -> usize {
+        (self.picks.len() + self.first_number()).saturating_sub(1)
+    }
+
     /// How many digits the longest number needs — what aligns the list and caps the typing.
     fn digits(&self) -> usize {
-        self.picks.len().max(1).to_string().len()
+        self.last_number().max(1).to_string().len()
     }
 }
 
@@ -108,7 +138,7 @@ pub(crate) fn render(menu: &Menu, width: usize) -> Vec<String> {
     lines.push(menu.question.clone());
     let digits = menu.digits();
     for (at, pick) in menu.picks.iter().enumerate() {
-        let number = format!("{:>digits$})", at + 1);
+        let number = format!("{:>digits$})", at + menu.first_number());
         lines.push(match &pick.locked {
             // Dim, like a disabled box: shown so the reader knows it exists, and quiet about it.
             Some(why) => _style(format!("  {number} {}  — not yet: {why}", pick.label)).dim().to_string(),
@@ -305,6 +335,62 @@ mod tests {
         assert_eq!(wide.typed, "12", "twelve options take two digits");
         assert_eq!(apply(&mut wide, Key::Enter), MenuAction::Done(Chosen::Picked(11)));
         assert!(plain(&wide).iter().any(|line| line.starts_with("   1) option 0")), "numbers right-aligned to two digits");
+    }
+
+    /// A zeroth option is numbered 0 and drawn first, whenever it was added — the one that stands
+    /// apart, a new item beside the list — and the rest keep counting from 1, so each number is its
+    /// option's index. 0 is only on offer when it is there.
+    #[test]
+    fn a_zeroth_option_is_numbered_0_and_the_rest_keep_their_numbers() {
+        let files = || Menu::new("Which file?").pick("bills.toml").pick("birthday.toml");
+        let mut menu = files().zeroth("[NEW] from template");
+        assert_eq!(
+            plain(&menu),
+            [
+                "Which file?",
+                "  0) [NEW] from template",
+                "  1) bills.toml",
+                "  2) birthday.toml",
+                "> ▏",
+                "type a number · enter picks · esc cancels",
+            ]
+        );
+        let typed = |number: char| {
+            let mut menu = files().zeroth("[NEW] from template");
+            apply(&mut menu, Key::Char(number));
+            (apply(&mut menu, Key::Enter), menu.refused)
+        };
+        assert_eq!(typed('0').0, MenuAction::Done(Chosen::Picked(0)));
+        assert_eq!(typed('2').0, MenuAction::Done(Chosen::Picked(2)));
+        assert_eq!(typed('3').1.as_deref(), Some("there is no 3 — pick 0 to 2"));
+        apply(&mut menu, Key::Char('0'));
+        assert_eq!(apply(&mut menu, Key::Enter), MenuAction::Done(Chosen::Picked(0)));
+
+        let mut plain_menu = files();
+        apply(&mut plain_menu, Key::Char('0'));
+        apply(&mut plain_menu, Key::Enter);
+        assert_eq!(plain_menu.refused.as_deref(), Some("there is no 0 — pick 1 to 2"));
+
+        let again = Menu::new("?").zeroth("first").pick("a").zeroth("second");
+        assert_eq!(again.picks.iter().map(|pick| pick.label.as_str()).collect::<Vec<_>>(), ["second", "a"]);
+    }
+
+    /// With a zeroth option, the widest number is one less than the count: ten options and a
+    /// zeroth still take two digits, for the 10.
+    #[test]
+    fn a_zeroth_option_counts_toward_the_digits_as_its_number_does() {
+        let mut ten = Menu::new("?").zeroth("new");
+        for at in 1..=9 {
+            ten = ten.pick(format!("option {at}"));
+        }
+        apply(&mut ten, Key::Char('9'));
+        assert_eq!(apply(&mut ten, Key::Char('9')), MenuAction::Ignored, "0 to 9 need one digit");
+        let mut eleven = ten.clone().pick("option 10");
+        eleven.typed.clear();
+        apply(&mut eleven, Key::Char('1'));
+        apply(&mut eleven, Key::Char('0'));
+        assert_eq!(apply(&mut eleven, Key::Enter), MenuAction::Done(Chosen::Picked(10)));
+        assert!(plain(&eleven).iter().any(|line| line.starts_with("   0) new")), "numbers right-aligned to two digits");
     }
 
     /// No line may exceed the width it was drawn for — a wrapped line breaks the repaint, exactly

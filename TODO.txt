@@ -1,4 +1,6 @@
 
 shortcut (key) for adding/removing extra column per line (save on vertical space)
 
-green takes precedent over red? (if a box is both, green should display)
+mark in grey (background) the line where the cursor is, to avoid picking the wrong line
+
+check why catalogames isn't getting the " --- ^" bottom-folding-title prefix

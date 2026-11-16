@@ -88,7 +88,9 @@ form, file, or terminal was unusable.
 The simplest thing here, for the question "which of these?": a numbered list and a number typed in
 answer. No cursor — digits accumulate, `Enter` picks, `Esc` cancels, `Backspace` edits. An option
 can be *locked*: shown dimmed with the reason, and refused with it if its number is typed, which is
-how a menu says what will be on offer without pretending it already is.
+how a menu says what will be on offer without pretending it already is. One option can be the
+*zeroth*: numbered 0 and shown first, set apart from the list — a new item beside the existing ones
+— so its number stays put however long the list grows (`.zeroth("[NEW] from template")`).
 
 ```rust
 let mut menu = Menu::new("Which do you want to rice?")
